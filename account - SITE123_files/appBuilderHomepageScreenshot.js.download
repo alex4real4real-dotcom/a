@@ -1,0 +1,362 @@
+/**
+ * AI App Builder - Homepage screenshot capture for items_list.php previews.
+ *
+ * Loads index.html into an off-screen iframe at 1920px wide, reuses the existing
+ * appBuilderScreenshot.js inlining helpers (images / fonts / Font Awesome),
+ * captures a fixed 16:9 viewport, and posts the PNG to
+ * updateScreenshot.php which stores it on db_table_websites.screenshot.
+ *
+ * Triggered after every new app version (AI job, inline edit, restore, ...).
+ */
+
+function appBuilderBasePathTxt() {
+    if (typeof APP_CONFIG !== 'undefined' && APP_CONFIG.appBuilderBasePathTxt) {
+        return APP_CONFIG.appBuilderBasePathTxt;
+    }
+    if (typeof window !== 'undefined' && window.APP_BUILDER_BASE_PATH) {
+        return window.APP_BUILDER_BASE_PATH;
+    }
+    return '';
+}
+(function() {
+	'use strict';
+
+	var IFRAME_WIDTH_NUM = 1920;
+	var IFRAME_HEIGHT_NUM = 1080;
+
+	/**
+	 * Build the homepage URL the iframe should load. Always points to "/" for the
+	 * current website uniqueID so the capture works even if the editor is currently
+	 * showing a non-homepage page.
+	 *
+	 * @returns {string}
+	 */
+	function buildHomepageUrl() {
+		return APP_CONFIG.previewBaseURL + '/.preview-' + encodeURIComponent(APP_CONFIG.website_uniqueID) + '/?t=' + Date.now();
+	}
+
+	/**
+	 * Append a 1920x1080 hidden iframe to the document body. Off-screen + visibility:hidden
+	 * so users never see flicker, but still rendered so dom-to-image-more can capture it.
+	 *
+	 * @param {string} url_txt
+	 * @returns {HTMLIFrameElement}
+	 */
+	function createHiddenIframe(url_txt) {
+		var iframe_el = document.createElement('iframe');
+		iframe_el.setAttribute('aria-hidden', 'true');
+		iframe_el.setAttribute('tabindex', '-1');
+		iframe_el.style.position = 'fixed';
+		iframe_el.style.left = '-99999px';
+		iframe_el.style.top = '-99999px';
+		iframe_el.style.width = IFRAME_WIDTH_NUM + 'px';
+		iframe_el.style.height = IFRAME_HEIGHT_NUM + 'px';
+		iframe_el.style.border = '0';
+		iframe_el.style.visibility = 'hidden';
+		iframe_el.style.pointerEvents = 'none';
+		iframe_el.src = url_txt;
+		document.body.appendChild(iframe_el);
+		return iframe_el;
+	}
+
+	/**
+	 * @param {HTMLIFrameElement} iframe_el
+	 * @returns {Promise<void>}
+	 */
+	function waitForIframeLoad(iframe_el) {
+		return new Promise(function(resolve) {
+			iframe_el.addEventListener('load', function() { resolve(); });
+		});
+	}
+
+	/**
+	 * Wait one paint after iframe setup so responsive sections settle before capture.
+	 *
+	 * @param {Window} iframe_win
+	 * @returns {Promise<void>}
+	 */
+	function waitForIframePaint(iframe_win) {
+		return new Promise(function(resolve) {
+			var raf_fun = iframe_win && iframe_win.requestAnimationFrame ? iframe_win.requestAnimationFrame.bind(iframe_win) : window.requestAnimationFrame.bind(window);
+			raf_fun(function() {
+				raf_fun(function() {
+					resolve();
+				});
+			});
+		});
+	}
+
+	/**
+	 * Check if an element is visible and has meaningful rendered size.
+	 *
+	 * @param {Window} iframe_win
+	 * @param {Element} el
+	 * @returns {boolean}
+	 */
+	function isVisibleCaptureElement(iframe_win, el) {
+		if (!el || el.nodeType !== 1) {
+			return false;
+		}
+		var tag_txt = (el.tagName || '').toLowerCase();
+		if (tag_txt === 'script' || tag_txt === 'style' || tag_txt === 'template' || tag_txt === 'noscript') {
+			return false;
+		}
+		var cs_obj = iframe_win.getComputedStyle(el);
+		if (!cs_obj || cs_obj.display === 'none' || cs_obj.visibility === 'hidden' || parseFloat(cs_obj.opacity || '1') === 0) {
+			return false;
+		}
+		var rect_obj = el.getBoundingClientRect();
+		return rect_obj.width > 1 && rect_obj.height > 40;
+	}
+
+	/**
+	 * Find the first meaningful page section. Prefer semantic/hero sections and
+	 * fall back to the first large visible child after the header/nav.
+	 *
+	 * @param {Document} iframe_doc
+	 * @param {Window} iframe_win
+	 * @returns {Element|null}
+	 */
+	function findFirstHomepageSection(iframe_doc, iframe_win) {
+		var selector_txt = 'main section, main [class*="hero"], main [id*="hero"], section, [class*="hero"], [id*="hero"]';
+		var candidates_arr = Array.prototype.slice.call(iframe_doc.querySelectorAll(selector_txt));
+		for (var i = 0; i < candidates_arr.length; i++) {
+			if (isVisibleCaptureElement(iframe_win, candidates_arr[i])) {
+				return candidates_arr[i];
+			}
+		}
+
+		var root_el = iframe_doc.querySelector('main') || iframe_doc.body;
+		var children_arr = Array.prototype.slice.call(root_el ? root_el.children : []);
+		for (var j = 0; j < children_arr.length; j++) {
+			var child_el = children_arr[j];
+			var tag_txt = (child_el.tagName || '').toLowerCase();
+			if (tag_txt === 'header' || tag_txt === 'nav') {
+				continue;
+			}
+			if (isVisibleCaptureElement(iframe_win, child_el)) {
+				return child_el;
+			}
+		}
+
+		return null;
+	}
+
+	/**
+	 * Remove every DOM node that comes after the navbar/header + first section so the
+	 * capture only serializes the part we actually keep. Without this, dom-to-image-more
+	 * serializes the WHOLE document (every section, footer, and all their inlined
+	 * images/resources) into a single foreignObject SVG even though we only crop the top.
+	 * On tall 1920px template homepages that SVG grows past the browser's rasterization
+	 * limit and fails with "failed to rasterize the generated image". The iframe is a
+	 * throwaway hidden frame, so mutating it here is safe.
+	 *
+	 * @param {Document} iframe_doc
+	 * @param {Element} keep_el
+	 * @returns {void}
+	 */
+	function trimDomAfterFirstSection(iframe_doc, keep_el) {
+		var node_el = keep_el;
+		while (node_el && node_el !== iframe_doc.body && node_el !== iframe_doc.documentElement && node_el.parentNode) {
+			var sibling_node = node_el.nextSibling;
+			while (sibling_node) {
+				var next_sibling_node = sibling_node.nextSibling;
+				sibling_node.parentNode.removeChild(sibling_node);
+				sibling_node = next_sibling_node;
+			}
+			node_el = node_el.parentNode;
+		}
+	}
+
+	/**
+	 * Prepare a fixed 16:9 hidden iframe for screenshot capture.
+	 *
+	 * @param {HTMLIFrameElement} iframe_el
+	 * @returns {Promise<void>}
+	 */
+	function prepareIframeForFixedViewport(iframe_el) {
+		var iframe_win = iframe_el.contentWindow;
+		var iframe_doc = iframe_el.contentDocument;
+		if (!iframe_win || !iframe_doc || !iframe_doc.body) {
+			return Promise.resolve();
+		}
+
+		var first_section_el = findFirstHomepageSection(iframe_doc, iframe_win);
+		if (first_section_el) {
+			trimDomAfterFirstSection(iframe_doc, first_section_el);
+		}
+
+		iframe_doc.documentElement.style.minHeight = IFRAME_HEIGHT_NUM + 'px';
+		iframe_doc.body.style.minHeight = IFRAME_HEIGHT_NUM + 'px';
+		iframe_el.style.height = IFRAME_HEIGHT_NUM + 'px';
+		iframe_win.scrollTo(0, 0);
+
+		forceRevealScrollAnimationsForCapture(iframe_doc, iframe_win);
+
+		return waitForIframePaint(iframe_win);
+	}
+
+	/**
+	 * True when a computed transform is only a translation (no scale/rotate/skew),
+	 * so resetting it to none just removes a slide offset without moving scaled or
+	 * rotated decorative elements.
+	 *
+	 * @param {string} transform_txt
+	 * @returns {boolean}
+	 */
+	function isTranslateOnlyTransform(transform_txt) {
+		if (!transform_txt || transform_txt === 'none') {
+			return true;
+		}
+		var matrix_match_arr = String(transform_txt).match(/^matrix\(([^)]+)\)$/);
+		if (!matrix_match_arr) {
+			return false;
+		}
+		var parts_arr = matrix_match_arr[1].split(',').map(function(part_txt) {
+			return parseFloat(part_txt);
+		});
+		if (parts_arr.length !== 6) {
+			return false;
+		}
+		function isNear(value_num, target_num) {
+			return Math.abs(value_num - target_num) < 0.001;
+		}
+		return isNear(parts_arr[0], 1) && isNear(parts_arr[1], 0) && isNear(parts_arr[2], 0) && isNear(parts_arr[3], 1);
+	}
+
+	/**
+	 * Reveal scroll/entrance animation elements before capture.
+	 *
+	 * @param {Document} iframe_doc
+	 * @param {Window} iframe_win
+	 * @returns {void}
+	 */
+	function forceRevealScrollAnimationsForCapture(iframe_doc, iframe_win) {
+		if (!iframe_doc || !iframe_doc.body || !iframe_win) {
+			return;
+		}
+		var nodes_arr = iframe_doc.body.querySelectorAll('*');
+		for (var i = 0; i < nodes_arr.length; i++) {
+			var el = nodes_arr[i];
+			var cs_obj = iframe_win.getComputedStyle(el);
+			if (!cs_obj || cs_obj.display === 'none' || cs_obj.visibility === 'hidden') {
+				continue;
+			}
+			if (parseFloat(cs_obj.opacity || '1') > 0.01) {
+				continue;
+			}
+			el.style.setProperty('opacity', '1', 'important');
+			// Only neutralize pure translate offsets (the typical "slide up/in" entrance
+			// transform). Leave scale/rotate/skew transforms in place so decorative
+			// elements are not repositioned.
+			if (isTranslateOnlyTransform(cs_obj.transform)) {
+				el.style.setProperty('transform', 'none', 'important');
+			}
+			el.style.setProperty('animation', 'none', 'important');
+			el.style.setProperty('transition', 'none', 'important');
+		}
+	}
+
+	/**
+	 * Convert a captured canvas or PNG blob to a base64 payload (no data: prefix).
+	 *
+	 * @param {HTMLCanvasElement|Blob} capture_result_obj
+	 * @returns {Promise<string>}
+	 */
+	function captureResultToBase64Png(capture_result_obj) {
+		if (capture_result_obj instanceof Blob) {
+			return new Promise(function(resolve, reject) {
+				var reader = new FileReader();
+				reader.onloadend = function() {
+					var data_url_txt = reader.result;
+					resolve(data_url_txt.substring(data_url_txt.indexOf(',') + 1));
+				};
+				reader.onerror = function() {
+					reject(new Error('homepage_screenshot_blob_read_failed'));
+				};
+				reader.readAsDataURL(capture_result_obj);
+			});
+		}
+		return canvasToBase64Png(capture_result_obj);
+	}
+
+	/**
+	 * Convert the captured canvas to a base64 PNG (no data: prefix).
+	 *
+	 * @param {HTMLCanvasElement} canvas
+	 * @returns {Promise<string>}
+	 */
+	function canvasToBase64Png(canvas) {
+		return new Promise(function(resolve) {
+			canvas.toBlob(function(blob) {
+				var reader = new FileReader();
+				reader.onloadend = function() {
+					var data_url_txt = reader.result;
+					resolve(data_url_txt.substring(data_url_txt.indexOf(',') + 1));
+				};
+				reader.readAsDataURL(blob);
+			}, 'image/png');
+		});
+	}
+
+	/**
+	 * POST the base64 PNG to updateScreenshot.php and parse the JSON response.
+	 *
+	 * @param {string} image_b64_txt
+	 * @param {{replace_custom_boo?: boolean}=} options_obj
+	 * @returns {Promise<{success_boo: boolean, screenshot_url_txt?: string, version_num?: number}>}
+	 */
+	function uploadScreenshot(image_b64_txt, options_obj) {
+		var form_data = new FormData();
+		form_data.append('w', String(APP_CONFIG.websiteID));
+		form_data.append('wu', String(APP_CONFIG.website_uniqueID));
+		form_data.append('image_b64', image_b64_txt);
+		if (options_obj && options_obj.replace_custom_boo) {
+			form_data.append('replace_custom', '1');
+		}
+
+		return window.fetch(appBuilderBasePathTxt() + '/updateScreenshot.php', {
+			method: 'POST',
+			body: form_data,
+			credentials: 'same-origin'
+		}).then(function(r) { return r.json(); });
+	}
+
+	/**
+	 * Public capture entry point.
+	 *
+	 * @param {{replace_custom_boo?: boolean}=} options_obj
+	 * @returns {Promise<{success_boo: boolean, screenshot_url_txt?: string}>}
+	 */
+	function capture(options_obj) {
+		var iframe_el = createHiddenIframe(buildHomepageUrl());
+
+		return waitForIframeLoad(iframe_el).then(function() {
+			return prepareIframeForFixedViewport(iframe_el);
+		}).then(function() {
+			return window.AppBuilderScreenshot.captureIframeElementCanvas(iframe_el, 'viewport');
+		}).then(function(capture_result_obj) {
+			if (!capture_result_obj) {
+				throw new Error('homepage_screenshot_capture_failed');
+			}
+			return captureResultToBase64Png(capture_result_obj);
+		}).then(function(image_b64_txt) {
+			return uploadScreenshot(image_b64_txt, options_obj);
+		}).then(function(response_obj) {
+			iframe_el.parentNode.removeChild(iframe_el);
+			return response_obj;
+		}).catch(function(error_obj) {
+			if (iframe_el && iframe_el.parentNode) {
+				iframe_el.parentNode.removeChild(iframe_el);
+			}
+			return {
+				success_boo: false,
+				error_txt: error_obj && error_obj.message ? error_obj.message : 'homepage_screenshot_capture_failed'
+			};
+		});
+	}
+
+	window.AppBuilderHomepageScreenshot = {
+		capture: capture
+	};
+})();

@@ -1,0 +1,3358 @@
+/**
+ * AI App Builder — preview screenshot (dom-to-image-more).
+ * Loaded on demand when the user clicks the screenshot tool.
+ */
+(function() {
+    'use strict';
+
+    var SCREENSHOT_TRANSPARENT_PLACEHOLDER_TXT = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+    var SCREENSHOT_ANIM_FREEZE_CSS_TXT =
+        '*, *::before, *::after {' +
+        '  animation-delay: 0s !important;' +
+        '  animation-duration: 0s !important;' +
+        '  transition-delay: 0s !important;' +
+        '  transition-duration: 0s !important;' +
+        '}' +
+        '[data-aos], .aos-init, .aos-animate,' +
+        '[data-animate], [data-scroll], .wow,' +
+        '.reveal, .fade-in, .slide-up, .slide-in {' +
+        '  opacity: 1 !important;' +
+        '  visibility: visible !important;' +
+        '  animation-fill-mode: forwards !important;' +
+        '}';
+    var DOM_TO_IMAGE_CDN_URL_TXT = 'https://cdn.jsdelivr.net/npm/dom-to-image-more@3.11.0/dist/dom-to-image-more.min.js';
+    var SCREENSHOT_MAX_PREINLINE_BG_DATA_URI_LEN_NUM = 750000;
+
+    /**
+     * Advisor design reference capture only: renders at 2x the preview layout width (1280 -> 2560 px)
+     * so the image model can read small text. Canvas pixel area stays under the browser limit
+     * (Safari ~16.7M px; Chrome / Firefox allow far more) and each side under Firefox's 32767 px
+     * limit; long pages get a lower scale (never below 1x).
+     */
+    var SCREENSHOT_DESIGN_REFERENCE_SCALE_NUM = 2;
+    var SCREENSHOT_IS_SAFARI_BOO = /^((?!chrome|chromium|crios|fxios|android|edg).)*safari/i.test(navigator.userAgent || '');
+    var SCREENSHOT_MAX_CANVAS_AREA_PX_NUM = SCREENSHOT_IS_SAFARI_BOO ? 16000000 : 40000000;
+    var SCREENSHOT_MAX_CANVAS_SIDE_PX_NUM = 32000;
+    /**
+     * Advisor design source screenshot: the server accepts up to 12 MB raw
+     * (APP_BUILDER_ADVISOR_DESIGN_REFERENCE_MAX_BYTES_NUM) and it is posted as base64 (+33%).
+     */
+    var SCREENSHOT_DESIGN_REFERENCE_MAX_BYTES_NUM = 8 * 1024 * 1024;
+    var SCREENSHOT_JPEG_QUALITY_NUM = 0.92;
+    /**
+     * Above this canvas area a site PNG is almost always over the 8 MB cap, so encoding it
+     * first only wastes seconds before the JPEG fallback - start with JPEG instead.
+     */
+    var SCREENSHOT_PNG_MAX_AREA_PX_NUM = 6000000;
+
+    /**
+     * <video> is painted by the compositor, not the DOM, so foreignObject SVG
+     * serialization always renders it as an empty/black box. Before capture each
+     * video is replaced by an <img> stand-in holding a still frame; these
+     * attributes mark the temporary nodes so they can be reverted afterwards.
+     */
+    var SCREENSHOT_VIDEO_STANDIN_ATTR_TXT = 'data-screenshot-video-standin';
+    var SCREENSHOT_VIDEO_HIDDEN_ATTR_TXT = 'data-screenshot-video-hidden';
+    var SCREENSHOT_VIDEO_FRAME_TIMEOUT_MS_NUM = 2500;
+    var SCREENSHOT_VIDEO_COPY_PROPS_ARR = [
+        'position',
+        'top',
+        'right',
+        'bottom',
+        'left',
+        'width',
+        'height',
+        'minWidth',
+        'minHeight',
+        'maxWidth',
+        'maxHeight',
+        'marginTop',
+        'marginRight',
+        'marginBottom',
+        'marginLeft',
+        'objectFit',
+        'objectPosition',
+        'borderRadius',
+        'zIndex',
+        'transform'
+    ];
+
+    var screenshot_data_uri_cache_obj = {};
+    function resetScreenshotCaptureCacheFun() {
+        screenshot_data_uri_cache_obj = {};
+    }
+
+    /**
+     * Fetch a URL as a base64 data URI via the iframe's fetch context.
+     * Returns null on failure.
+     */
+    function fetchAsDataUri(win, url_txt) {
+        var normalized_url_txt = normalizeScreenshotResourceUrlTxt(url_txt);
+        if (!normalized_url_txt || isScreenshotInlineResourceUrlBoo(normalized_url_txt)) {
+            return Promise.resolve(null);
+        }
+        return win.fetch(normalized_url_txt, { mode: 'cors' })
+            .then(function(r) { return r.blob(); })
+            .then(function(blob) {
+                return new Promise(function(resolve) {
+                    var reader = new FileReader();
+                    reader.onloadend = function() { resolve(reader.result); };
+                    reader.onerror = function() { resolve(null); };
+                    reader.readAsDataURL(blob);
+                });
+            })
+            .catch(function() { return null; });
+    }
+
+    /**
+     * Same-origin manager endpoint: f-static CDN has no CORS; server fetches bytes and returns data URI.
+     */
+    function fetchAsDataUriViaScreenshotProxy(url_txt) {
+        if (typeof window === 'undefined' || typeof APP_CONFIG === 'undefined' || !APP_CONFIG.screenshotImageProxyPath_txt) {
+            return Promise.resolve(null);
+        }
+        // Skip the request entirely when the server allowlist would reject it with a 400 (url_not_allowed).
+        if (!isUrlAcceptedByScreenshotProxyBoo(url_txt)) {
+            return Promise.resolve(null);
+        }
+        // Always POST an absolute URL — the server-side parse_url() 400s on relative strings.
+        try {
+            url_txt = new URL(url_txt, window.location.href).href;
+        } catch (e_abs) {
+            return Promise.resolve(null);
+        }
+        var form_data = new FormData();
+        if (APP_CONFIG.websiteID) {
+            form_data.append('w', String(APP_CONFIG.websiteID));
+        }
+        if (APP_CONFIG.website_uniqueID) {
+            form_data.append('wu', String(APP_CONFIG.website_uniqueID));
+        }
+        form_data.append('image_url_txt', normalizeScreenshotProxyImageUrlTxt(url_txt));
+        return window
+            .fetch(APP_CONFIG.screenshotImageProxyPath_txt, {
+                method: 'POST',
+                body: form_data,
+                credentials: 'same-origin'
+            })
+            .then(function(r) {
+                if (!r.ok) {
+                    return null;
+                }
+                return r.json();
+            })
+            .then(function(json_obj) {
+                if (json_obj && json_obj.success_boo && json_obj.data_uri_txt) {
+                    return json_obj.data_uri_txt;
+                }
+                return null;
+            })
+            .catch(function() {
+                return null;
+            });
+    }
+
+    /**
+     * Hosts whose CDN never returns Access-Control-Allow-Origin AND that the
+     * server-side screenshot proxy is allowed to fetch on our behalf. For
+     * URLs on these hosts the cross-origin fetch attempts in the iframe and
+     * parent window are guaranteed to fail with a noisy CORS error, so we
+     * skip them and go straight to the proxy.
+     *
+     * Other cross-origin URLs (Google Fonts, FontAwesome CDN, etc.) usually
+     * DO have CORS headers and resolve via the fast iframe fetch — we leave
+     * those alone so we don't regress timing or hit 400s on the proxy
+     * allowlist.
+     *
+     * Mirror of the allowlist in `screenshotFetchImage.php`.
+     */
+    var SCREENSHOT_PROXY_HOST_SUFFIXES_ARR = [
+        'f-static.com',
+        'cdn-files-a.com',
+        'site123.com'
+    ];
+
+    function isUrlServedByScreenshotProxy(url_txt) {
+        try {
+            if (!url_txt) {
+                return false;
+            }
+            var resolved_obj = new URL(url_txt, window.location.href);
+            var host_txt = resolved_obj.hostname.toLowerCase();
+            for (var i = 0; i < SCREENSHOT_PROXY_HOST_SUFFIXES_ARR.length; i++) {
+                var suffix_txt = SCREENSHOT_PROXY_HOST_SUFFIXES_ARR[i];
+                if (host_txt === suffix_txt) {
+                    return true;
+                }
+                if (host_txt.length > suffix_txt.length
+                    && host_txt.slice(-(suffix_txt.length + 1)) === '.' + suffix_txt) {
+                    return true;
+                }
+            }
+            // SITE123 CDN family: s123-cdn-{static|network}-{a..z}.com (optional subdomain).
+            if (/(^|\.)s123-cdn-(static|network)-[a-z]\.com$/.test(host_txt)) {
+                return true;
+            }
+            return false;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    /**
+     * Full mirror of the server allowlist in `screenshotFetchImage.php`: the CDN
+     * suffixes above plus the AI App Builder private S3 bucket
+     * ({bucket}.s3[.-]{region}.amazonaws.com presigned URLs — the server still
+     * validates the exact bucket name). Any other host gets a guaranteed 400
+     * (url_not_allowed) from the proxy, so we never send the request; the
+     * caller treats the image as non-inlinable, same as a failed proxy fetch.
+     */
+    function isUrlAcceptedByScreenshotProxyBoo(url_txt) {
+        try {
+            if (!url_txt) {
+                return false;
+            }
+            var resolved_obj = new URL(url_txt, window.location.href);
+            // Server rejects non-http(s) schemes, and plain http outside local dev.
+            if (resolved_obj.protocol !== 'https:'
+                && !(resolved_obj.protocol === 'http:' && window.location.protocol === 'http:')) {
+                return false;
+            }
+            /**
+             * Same-origin resources never need the proxy: the browser fetch includes
+             * session cookies while the server-side curl has none, so the proxy can
+             * only do worse (manager/preview hosts also suffix-match site123.com).
+             */
+            if (resolved_obj.origin === window.location.origin) {
+                return false;
+            }
+            if (isUrlServedByScreenshotProxy(url_txt)) {
+                return true;
+            }
+            return /\.s3[.\-][a-z0-9\-]*\.?amazonaws\.com$/.test(resolved_obj.hostname.toLowerCase());
+        } catch (e) {
+            return false;
+        }
+    }
+
+    /**
+     * Absolutize a resource URL against the preview iframe document (its baseURI
+     * honors the injected preview <base href>). Computed styles usually return
+     * absolute URLs, but url() values that pass through CSS custom properties
+     * keep the raw relative string — POSTing that to the proxy is a guaranteed
+     * 400 because the server-side parse_url() sees no host.
+     */
+    function resolveScreenshotResourceAbsoluteUrlTxt(iframe_win, url_txt) {
+        var base_txt = '';
+        try {
+            if (iframe_win && iframe_win.document && iframe_win.document.baseURI) {
+                base_txt = iframe_win.document.baseURI;
+            }
+        } catch (e_base) {}
+        try {
+            return new URL(url_txt, base_txt || window.location.href).href;
+        } catch (e_resolve) {
+            return url_txt;
+        }
+    }
+
+    /**
+     * Proxy fetches need the original JPEG/PNG bytes — strip `format=avif` so PHP can decode the image.
+     */
+    function normalizeScreenshotProxyImageUrlTxt(url_txt) {
+        if (!url_txt) {
+            return url_txt;
+        }
+        try {
+            var parsed_obj = new URL(url_txt, window.location.href);
+            if (parsed_obj.searchParams.get('format') !== 'avif') {
+                return url_txt;
+            }
+            parsed_obj.searchParams.delete('format');
+            var normalized_txt = parsed_obj.origin + parsed_obj.pathname;
+            var query_txt = parsed_obj.searchParams.toString();
+            if (query_txt !== '') {
+                normalized_txt += '?' + query_txt;
+            }
+            if (parsed_obj.hash) {
+                normalized_txt += parsed_obj.hash;
+            }
+            return normalized_txt;
+        } catch (e_norm) {
+            return url_txt.replace(/([?&])format=avif(?=&|$)/i, '$1').replace(/[?&]$/, '');
+        }
+    }
+
+    /**
+     * Try iframe fetch, then parent window fetch, then same-origin PHP proxy (CDN without CORS).
+     *
+     * For hosts we know the proxy can serve we skip the iframe and parent
+     * fetch attempts to avoid the browser logging a CORS error on every call.
+     */
+    function fetchAsDataUriWithParentFallback(iframe_win, url_txt) {
+        var normalized_url_txt = normalizeScreenshotResourceUrlTxt(url_txt);
+        if (!normalized_url_txt || isScreenshotInlineResourceUrlBoo(normalized_url_txt)) {
+            return Promise.resolve(null);
+        }
+        /* Absolutize before any allowlist check or proxy POST — a relative string suffix-matches site123.com after resolution but 400s on the server. */
+        normalized_url_txt = resolveScreenshotResourceAbsoluteUrlTxt(iframe_win, normalized_url_txt);
+        if (screenshot_data_uri_cache_obj[normalized_url_txt]) {
+            return screenshot_data_uri_cache_obj[normalized_url_txt];
+        }
+        var fetch_promise_obj;
+        if (isUrlServedByScreenshotProxy(normalized_url_txt) && isUrlAcceptedByScreenshotProxyBoo(normalized_url_txt)) {
+            fetch_promise_obj = fetchAsDataUriViaScreenshotProxy(normalized_url_txt);
+        } else {
+            fetch_promise_obj = fetchAsDataUri(iframe_win, normalized_url_txt).then(function(data_txt) {
+                if (data_txt) {
+                    return data_txt;
+                }
+                if (typeof window !== 'undefined' && window !== iframe_win) {
+                    return fetchAsDataUri(window, normalized_url_txt).then(function(data2_txt) {
+                        if (data2_txt) {
+                            return data2_txt;
+                        }
+                        return fetchAsDataUriViaScreenshotProxy(normalized_url_txt);
+                    });
+                }
+                return fetchAsDataUriViaScreenshotProxy(normalized_url_txt);
+            });
+        }
+        screenshot_data_uri_cache_obj[normalized_url_txt] = fetch_promise_obj;
+        return fetch_promise_obj;
+    }
+
+    /**
+     * Strip wrapping quotes dom-to-image-more may pass from css url("...") values.
+     */
+    function normalizeScreenshotResourceUrlTxt(url_txt) {
+        if (!url_txt) {
+            return '';
+        }
+        var txt = String(url_txt).trim();
+        if ((txt.charAt(0) === '"' && txt.charAt(txt.length - 1) === '"')
+            || (txt.charAt(0) === "'" && txt.charAt(txt.length - 1) === "'")) {
+            txt = txt.slice(1, -1).trim();
+        }
+        return txt;
+    }
+
+    /**
+     * True when the resource is already inline or not fetchable over HTTP.
+     */
+    function isScreenshotInlineResourceUrlBoo(url_txt) {
+        var normalized_url_txt = normalizeScreenshotResourceUrlTxt(url_txt);
+        if (!normalized_url_txt) {
+            return true;
+        }
+        var lower_txt = normalized_url_txt.toLowerCase();
+        if (lower_txt.indexOf('data:') === 0) {
+            return true;
+        }
+        if (lower_txt.indexOf('blob:') === 0) {
+            return true;
+        }
+        if (lower_txt.indexOf('#') === 0) {
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Parse url(...) values from a computed background/mask CSS value.
+     */
+    function extractImageUrlsFromCssValueTxt(css_value_txt) {
+        var urls_arr = [];
+        if (!css_value_txt || css_value_txt === 'none') {
+            return urls_arr;
+        }
+        var url_regex = /url\(['"]?([^'")\s]+)['"]?\)/gi;
+        var match;
+        while ((match = url_regex.exec(css_value_txt)) !== null) {
+            if (match[1].indexOf('data:') !== 0) {
+                urls_arr.push(match[1]);
+            }
+        }
+        return urls_arr;
+    }
+
+    /**
+     * Normalize URL for viewport image path matching (strip avif query param).
+     */
+    function normalizeScreenshotUrlForDomMatchTxt(url_txt) {
+        var base_txt = normalizeScreenshotResourceUrlTxt(url_txt);
+        try {
+            var parsed_obj = new URL(base_txt, window.location.href);
+            parsed_obj.searchParams.delete('format');
+            var out_txt = parsed_obj.origin + parsed_obj.pathname;
+            var query_txt = parsed_obj.searchParams.toString();
+            if (query_txt) {
+                out_txt += '?' + query_txt;
+            }
+            return out_txt;
+        } catch (e_match) {
+            return base_txt.replace(/([?&])format=avif(?=&|$)/i, '$1').replace(/[?&]$/, '');
+        }
+    }
+
+    /**
+     * Pathname key for viewport image set membership (avif query stripped).
+     */
+    function getScreenshotUrlPathnameKeyTxt(url_txt) {
+        try {
+            return new URL(normalizeScreenshotUrlForDomMatchTxt(url_txt), window.location.href).pathname;
+        } catch (e_path_key) {
+            return normalizeScreenshotUrlForDomMatchTxt(url_txt);
+        }
+    }
+
+    /**
+     * Viewport capture: collect image pathnames referenced by elements overlapping the visible area.
+     */
+    function buildViewportVisibleImagePathsSetFun(iframe_doc, iframe_win, metrics_obj) {
+        var paths_set_obj = {};
+        var viewport_w_num = metrics_obj.viewport_w_num;
+        var viewport_h_num = metrics_obj.viewport_h_num;
+        function add_url_if_element_in_viewport_fun(el, url_txt) {
+            if (!url_txt || !isScreenshotImageResourceUrlBoo(url_txt)) {
+                return;
+            }
+            if (!rects_intersect_viewport_fun(el.getBoundingClientRect(), viewport_w_num, viewport_h_num)) {
+                return;
+            }
+            paths_set_obj[getScreenshotUrlPathnameKeyTxt(url_txt)] = true;
+        }
+        iframe_doc.querySelectorAll('img').forEach(function(img_el) {
+            add_url_if_element_in_viewport_fun(img_el, img_el.currentSrc || img_el.src || '');
+            ['src', 'data-src', 'data-lazy-src'].forEach(function(attr_txt) {
+                add_url_if_element_in_viewport_fun(img_el, img_el.getAttribute(attr_txt));
+            });
+        });
+        iframe_doc.querySelectorAll('*').forEach(function(el) {
+            try {
+                var cs_obj = iframe_win.getComputedStyle(el);
+                if (cs_obj.display === 'none' || cs_obj.visibility === 'hidden') {
+                    return;
+                }
+                extractImageUrlsFromCssValueTxt(cs_obj.getPropertyValue('background-image')).forEach(function(bg_url_txt) {
+                    add_url_if_element_in_viewport_fun(el, bg_url_txt);
+                });
+            } catch (e_viewport_scan) {}
+        });
+        return paths_set_obj;
+    }
+
+    /**
+     * True when url pathname is referenced by a viewport-visible element (viewport mode only).
+     */
+    function isScreenshotUrlInViewportVisibleSetBoo(url_txt, viewport_paths_set_obj) {
+        if (!viewport_paths_set_obj) {
+            return true;
+        }
+        return !!viewport_paths_set_obj[getScreenshotUrlPathnameKeyTxt(url_txt)];
+    }
+
+    /**
+     * Viewport capture: off-screen <img> tags cannot be XHR-fetched (no CORS). Use a transparent
+     * placeholder on the clone only — CSS background-image URLs still proxy-fetch via interceptor.
+     */
+    function apply_viewport_offscreen_img_placeholder_to_clone_fun(live_el, clone_el, metrics_obj) {
+        if (!live_el || !clone_el || live_el.nodeType !== 1 || !metrics_obj) {
+            return;
+        }
+        if ((live_el.tagName || '').toLowerCase() !== 'img') {
+            return;
+        }
+        // Video stand-ins already hold an inline data: frame; blanking them would
+        // undo the whole point of the pre-capture swap.
+        if (live_el.hasAttribute(SCREENSHOT_VIDEO_STANDIN_ATTR_TXT)) {
+            return;
+        }
+        if (rects_intersect_viewport_fun(
+            live_el.getBoundingClientRect(),
+            metrics_obj.viewport_w_num,
+            metrics_obj.viewport_h_num
+        )) {
+            return;
+        }
+        var src_txt = live_el.currentSrc || live_el.src || live_el.getAttribute('src') || '';
+        if (!src_txt || !isScreenshotImageResourceUrlBoo(src_txt)) {
+            return;
+        }
+        clone_el.setAttribute('src', SCREENSHOT_TRANSPARENT_PLACEHOLDER_TXT);
+        clone_el.removeAttribute('srcset');
+        clone_el.removeAttribute('data-src');
+    }
+
+    /**
+     * dom-to-image-more requestInterceptor: supply data URIs for external resources
+     * during capture (live preview DOM is not mutated for inlining).
+     */
+    function buildScreenshotRequestInterceptorFun(iframe_win, viewport_capture_boo, viewport_paths_set_obj) {
+        return function(url_txt, context_obj) {
+            if (context_obj && context_obj.status !== undefined) {
+                return undefined;
+            }
+            var normalized_url_txt = normalizeScreenshotResourceUrlTxt(url_txt);
+            if (!normalized_url_txt) {
+                return undefined;
+            }
+            if (isScreenshotInlineResourceUrlBoo(normalized_url_txt)) {
+                if (normalized_url_txt.toLowerCase().indexOf('data:') === 0) {
+                    return normalized_url_txt;
+                }
+                return undefined;
+            }
+            if (!shouldDomToImageInlineResourceUrlBoo(normalized_url_txt)) {
+                return undefined;
+            }
+            if (viewport_capture_boo && viewport_paths_set_obj
+                && !isScreenshotUrlInViewportVisibleSetBoo(normalized_url_txt, viewport_paths_set_obj)) {
+                return SCREENSHOT_TRANSPARENT_PLACEHOLDER_TXT;
+            }
+            if (screenshot_data_uri_cache_obj[normalized_url_txt]) {
+                return screenshot_data_uri_cache_obj[normalized_url_txt];
+            }
+            return fetchAsDataUriWithParentFallback(iframe_win, normalized_url_txt);
+        };
+    }
+
+    /**
+     * Stylesheets are already linked in the preview; re-fetching them during capture is redundant.
+     */
+    function isScreenshotStylesheetResourceUrlBoo(url_txt) {
+        var normalized_url_txt = normalizeScreenshotResourceUrlTxt(url_txt).toLowerCase();
+        var path_txt = normalized_url_txt.split('?')[0].split('#')[0];
+        if (/\.css$/i.test(path_txt)) {
+            return true;
+        }
+        if (/fonts\.googleapis\.com/i.test(normalized_url_txt)) {
+            return true;
+        }
+        if (/daisyui@/i.test(normalized_url_txt) || /@tailwindcss/i.test(normalized_url_txt)) {
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Font binaries are inlined once during prepareIframeForCapture — skip dom-to-image re-fetch.
+     */
+    function isScreenshotFontResourceUrlBoo(url_txt) {
+        var path_txt = normalizeScreenshotResourceUrlTxt(url_txt).toLowerCase().split('?')[0].split('#')[0];
+        return /\.(woff2?|ttf|otf|eot)$/i.test(path_txt);
+    }
+
+    /**
+     * Only raster/vector images need CORS/proxy inlining during capture.
+     */
+    function isScreenshotImageResourceUrlBoo(url_txt) {
+        var normalized_url_txt = normalizeScreenshotResourceUrlTxt(url_txt);
+        if (!normalized_url_txt) {
+            return false;
+        }
+        if (isUrlServedByScreenshotProxy(normalized_url_txt)) {
+            return true;
+        }
+        var path_txt = normalized_url_txt.toLowerCase().split('?')[0].split('#')[0];
+        if (/\.(png|jpe?g|gif|webp|avif|svg)$/i.test(path_txt)) {
+            return true;
+        }
+        if (/\/assets\//i.test(path_txt)) {
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Skip re-fetching inline/blob resources; dom-to-image-more keeps the original url().
+     */
+    function shouldDomToImageInlineResourceUrlBoo(url_txt) {
+        if (isScreenshotInlineResourceUrlBoo(url_txt)) {
+            return false;
+        }
+        var normalized_url_txt = normalizeScreenshotResourceUrlTxt(url_txt);
+        if (!normalized_url_txt || !/^https?:\/\//i.test(normalized_url_txt)) {
+            return false;
+        }
+        if (isScreenshotStylesheetResourceUrlBoo(normalized_url_txt)) {
+            return false;
+        }
+        if (isScreenshotFontResourceUrlBoo(normalized_url_txt)) {
+            return false;
+        }
+        return isScreenshotImageResourceUrlBoo(normalized_url_txt);
+    }
+
+    /**
+     * Load dom-to-image-more into the preview iframe (once per iframe context).
+     */
+    function ensureDomToImageLoadedFun(iframe_doc, iframe_win) {
+        if (iframe_win.domtoimage) {
+            return Promise.resolve();
+        }
+        return new Promise(function(resolve, reject) {
+            var script_el = iframe_doc.createElement('script');
+            script_el.src = DOM_TO_IMAGE_CDN_URL_TXT;
+            script_el.onload = function() { resolve(); };
+            script_el.onerror = function() {
+                reject(new Error('dom-to-image-more load failed'));
+            };
+            iframe_doc.head.appendChild(script_el);
+        });
+    }
+
+    /**
+     * Remove Alpine/Vue binding attributes from the cloned element before generating
+     * the screenshot. These attributes can break SVG creation but are unnecessary
+     * for a static image. XML namespace attributes are preserved.
+     */
+    function stripInvalidXmlAttributesFromCloneFun(clone_el) {
+        if (!clone_el || clone_el.nodeType !== 1 || !clone_el.attributes) {
+            return;
+        }
+        var attrs_arr = Array.prototype.slice.call(clone_el.attributes);
+        for (var i = 0; i < attrs_arr.length; i++) {
+            var name_txt = attrs_arr[i].name || '';
+            if (/^[A-Za-z_][A-Za-z0-9_.\-]*$/.test(name_txt)) {
+                continue;
+            }
+            if (/^(?:xmlns(?::[A-Za-z_][\w.\-]*)?|xlink:[A-Za-z_][\w.\-]*|xml:[A-Za-z_][\w.\-]*)$/.test(name_txt)) {
+                continue;
+            }
+            try {
+                clone_el.removeAttribute(name_txt);
+            } catch (e_rm) {}
+        }
+    }
+
+    /**
+     * dom-to-image-more options tuned for full style fidelity on builder previews.
+     */
+    function buildDomToImageCaptureOptionsFun(iframe_doc, iframe_win, metrics_obj, prep_cache_obj, include_ve_outline_hide_boo, viewport_capture_boo) {
+        var capture_bgcolor_txt = pick_screenshot_capture_bgcolor_txt(iframe_win);
+        var viewport_paths_set_obj = viewport_capture_boo
+            ? buildViewportVisibleImagePathsSetFun(iframe_doc, iframe_win, metrics_obj)
+            : null;
+        return {
+            bgcolor: capture_bgcolor_txt,
+            width: metrics_obj.render_w_num,
+            height: metrics_obj.render_h_num,
+            scale: 1,
+            copyDefaultStyles: true,
+            styleCaching: 'strict',
+            disableEmbedFonts: true,
+            loadExternalStyleSheet: function(href_txt) {
+                return /font-awesome|fontawesome|fonts\.googleapis|fonts\.gstatic|@tailwindcss|daisyui/i.test(href_txt || '');
+            },
+            cacheBust: false,
+            preserveScroll: false,
+            imagePlaceholder: SCREENSHOT_TRANSPARENT_PLACEHOLDER_TXT,
+            ignoreCSSRuleErrors: true,
+            filterUrls: shouldDomToImageInlineResourceUrlBoo,
+            filterStyles: function(node_el, property_name_txt) {
+                var prop_lower_txt = String(property_name_txt || '').toLowerCase();
+                if (
+                    prop_lower_txt === 'backdrop-filter' ||
+                    prop_lower_txt === '-webkit-backdrop-filter' ||
+                    prop_lower_txt === 'box-shadow' ||
+                    prop_lower_txt === '-webkit-box-shadow'
+                ) {
+                    return false;
+                }
+                return true;
+            },
+            requestInterceptor: buildScreenshotRequestInterceptorFun(
+                iframe_win,
+                viewport_capture_boo,
+                viewport_paths_set_obj
+            ),
+            adjustClonedNode: function(live_el, clone_el, after_boo) {
+                if (!after_boo || !live_el || !clone_el || live_el.nodeType !== 1) {
+                    return clone_el;
+                }
+                stripInvalidXmlAttributesFromCloneFun(clone_el);
+                hideClosedScreenshotDialogOnCloneFun(live_el, clone_el);
+                applyScreenshotNodeFixOnClonePairFun(live_el, clone_el, iframe_win);
+                if (viewport_capture_boo && metrics_obj) {
+                    apply_viewport_offscreen_img_placeholder_to_clone_fun(live_el, clone_el, metrics_obj);
+                    apply_viewport_pinned_position_to_clone_fun(live_el, clone_el, iframe_win, metrics_obj);
+                }
+                return clone_el;
+            },
+            onclone: function(cloned_root_el) {
+                if (!cloned_root_el) {
+                    return;
+                }
+                runScreenshotCloneHeadFixesFun(
+                    iframe_doc,
+                    cloned_root_el,
+                    prep_cache_obj || {},
+                    include_ve_outline_hide_boo
+                );
+            }
+        };
+    }
+
+    /**
+     * Rasterize an SVG data URI to canvas using a detached Image.
+     * dom-to-image-more's makeImage appends <img> into the live document, which
+     * fails for preview iframes; detached load in the iframe window works.
+     *
+     * @param {string} svg_data_uri_txt
+     * @param {number} width_num
+     * @param {number} height_num
+     * @param {Window} raster_win
+     * @returns {Promise<HTMLCanvasElement>}
+     */
+    function rasterizeSvgDataUriToCanvasDetachedFun(svg_data_uri_txt, width_num, height_num, raster_win) {
+        raster_win = raster_win || window;
+        return new Promise(function(resolve, reject) {
+            var img_el = new raster_win.Image();
+            var done_boo = false;
+            var finish_fun = function(ok_boo, result_obj) {
+                if (done_boo) {
+                    return;
+                }
+                done_boo = true;
+                if (ok_boo) {
+                    resolve(result_obj);
+                } else {
+                    reject(result_obj);
+                }
+            };
+            img_el.onload = function() {
+                try {
+                    var canvas_el = raster_win.document.createElement('canvas');
+                    canvas_el.width = Math.max(1, Math.round(width_num || img_el.naturalWidth || 1));
+                    canvas_el.height = Math.max(1, Math.round(height_num || img_el.naturalHeight || 1));
+                    canvas_el.getContext('2d').drawImage(img_el, 0, 0, canvas_el.width, canvas_el.height);
+                    finish_fun(true, canvas_el);
+                } catch (draw_err) {
+                    finish_fun(false, draw_err);
+                }
+            };
+            img_el.onerror = function() {
+                finish_fun(false, new Error('detached_svg_rasterize_failed'));
+            };
+            img_el.src = svg_data_uri_txt;
+            setTimeout(function() {
+                finish_fun(false, new Error('detached_svg_rasterize_timeout'));
+            }, 30000);
+        });
+    }
+
+    /**
+     * Pick the canvas scale for a capture: the requested scale, lowered so the
+     * canvas stays inside the browser canvas limits. Never below 1x.
+     */
+    function pickScreenshotOutputScaleNumFun(metrics_obj, requested_scale_num) {
+        if (!metrics_obj || !(requested_scale_num > 1)) {
+            return 1;
+        }
+        var width_num = Math.max(1, metrics_obj.render_w_num);
+        var height_num = Math.max(1, metrics_obj.render_h_num);
+        var scale_num = Math.min(
+            requested_scale_num,
+            Math.sqrt(SCREENSHOT_MAX_CANVAS_AREA_PX_NUM / (width_num * height_num)),
+            SCREENSHOT_MAX_CANVAS_SIDE_PX_NUM / width_num,
+            SCREENSHOT_MAX_CANVAS_SIDE_PX_NUM / height_num
+        );
+        return Math.max(1, scale_num);
+    }
+
+    /**
+     * Encode a canvas as PNG; when the file is over max_bytes_num, optionally retry as a
+     * full-resolution JPEG, then shrink the canvas and encode again (up to 3 attempts in total).
+     *
+     * @param {HTMLCanvasElement} canvas_el
+     * @param {number} max_bytes_num
+     * @param {boolean} jpeg_fallback_boo Try JPEG at full size before shrinking (keeps small text sharp)
+     * @return {Promise<Blob|null>}
+     */
+    function canvasToBlobWithinUploadCapFun(canvas_el, max_bytes_num, jpeg_fallback_boo) {
+        var cap_bytes_num = max_bytes_num;
+        return new Promise(function(resolve) {
+            var attempt_num = 0;
+            var mime_txt = 'image/png';
+            if (jpeg_fallback_boo && canvas_el.width * canvas_el.height > SCREENSHOT_PNG_MAX_AREA_PX_NUM) {
+                mime_txt = 'image/jpeg';
+            }
+            var encode_fun = function(source_canvas_el) {
+                source_canvas_el.toBlob(function(blob_obj) {
+                    if (!blob_obj || blob_obj.size <= cap_bytes_num || attempt_num >= 3) {
+                        resolve(blob_obj || null);
+                        return;
+                    }
+                    attempt_num++;
+                    if (jpeg_fallback_boo && mime_txt === 'image/png') {
+                        mime_txt = 'image/jpeg';
+                        encode_fun(source_canvas_el);
+                        return;
+                    }
+                    // File size grows with pixel area, so shrink both sides by the square root of the overshoot.
+                    var shrink_num = Math.sqrt(cap_bytes_num / blob_obj.size) * 0.9;
+                    var smaller_canvas_el = source_canvas_el.ownerDocument.createElement('canvas');
+                    smaller_canvas_el.width = Math.max(1, Math.round(source_canvas_el.width * shrink_num));
+                    smaller_canvas_el.height = Math.max(1, Math.round(source_canvas_el.height * shrink_num));
+                    var smaller_ctx = smaller_canvas_el.getContext('2d');
+                    smaller_ctx.imageSmoothingQuality = 'high';
+                    smaller_ctx.drawImage(source_canvas_el, 0, 0, smaller_canvas_el.width, smaller_canvas_el.height);
+                    encode_fun(smaller_canvas_el);
+                }, mime_txt, SCREENSHOT_JPEG_QUALITY_NUM);
+            };
+            encode_fun(canvas_el);
+        });
+    }
+
+    /**
+     * Capture documentElement via dom-to-image-more and return a canvas.
+     * output_scale_num > 1 rasterizes the SVG into a larger canvas (sharper, wider image).
+     */
+    function captureDocumentElementToCanvasFun(iframe_doc, iframe_win, options_obj, output_scale_num) {
+        return ensureDomToImageLoadedFun(iframe_doc, iframe_win).then(function() {
+            var width_num = options_obj && options_obj.width ? options_obj.width : (iframe_doc.documentElement.clientWidth || 1920);
+            var height_num = options_obj && options_obj.height ? options_obj.height : (iframe_doc.documentElement.clientHeight || 1080);
+            if (output_scale_num > 1) {
+                width_num = width_num * output_scale_num;
+                height_num = height_num * output_scale_num;
+            }
+            return iframe_win.domtoimage.toSvg(iframe_doc.documentElement, options_obj).then(function(svg_data_uri_txt) {
+                // dom-to-image has cloned the DOM into the SVG string above, so the live
+                // base64 srcs and video stand-ins are no longer needed — restore them
+                // before anything reads el.src or interacts with the preview again.
+                restoreInlinedImagesFun(iframe_doc);
+                restoreCapturedVideosFun(iframe_doc);
+                return rasterizeSvgDataUriToCanvasDetachedFun(svg_data_uri_txt, width_num, height_num, iframe_win);
+            }, function(err_obj) {
+                restoreInlinedImagesFun(iframe_doc);
+                restoreCapturedVideosFun(iframe_doc);
+                throw err_obj;
+            });
+        });
+    }
+
+    /**
+     * Layout viewport + document scroll metrics for preview-accurate capture/crop.
+     */
+    function getPreviewCaptureMetricsFun(iframe_el, iframe_doc, iframe_win) {
+        var doc_el = iframe_doc.documentElement;
+        var body_el = iframe_doc.body;
+        var render_w_num = Math.max(
+            doc_el.scrollWidth || 0,
+            doc_el.clientWidth || 0,
+            body_el ? body_el.scrollWidth : 0,
+            iframe_el ? iframe_el.clientWidth : 0
+        );
+        var render_h_num = Math.max(
+            doc_el.scrollHeight || 0,
+            body_el ? body_el.scrollHeight : 0,
+            iframe_el ? iframe_el.clientHeight : 0
+        );
+        var viewport_w_num = doc_el.clientWidth || iframe_win.innerWidth || (iframe_el ? iframe_el.clientWidth : 0) || render_w_num;
+        var viewport_h_num = doc_el.clientHeight || iframe_win.innerHeight || (iframe_el ? iframe_el.clientHeight : 0) || render_h_num;
+        var scroll_x_num = iframe_win.pageXOffset || doc_el.scrollLeft || 0;
+        var scroll_y_num = iframe_win.pageYOffset || doc_el.scrollTop || 0;
+
+        if (iframe_win.visualViewport) {
+            var vv_obj = iframe_win.visualViewport;
+            if (vv_obj.width > 0) {
+                viewport_w_num = vv_obj.width;
+            }
+            if (vv_obj.height > 0) {
+                viewport_h_num = vv_obj.height;
+            }
+            if (typeof vv_obj.pageLeft === 'number' && !isNaN(vv_obj.pageLeft)) {
+                scroll_x_num = vv_obj.pageLeft;
+            }
+            if (typeof vv_obj.pageTop === 'number' && !isNaN(vv_obj.pageTop)) {
+                scroll_y_num = vv_obj.pageTop;
+            }
+        }
+
+        viewport_w_num = Math.max(1, Math.round(viewport_w_num));
+        viewport_h_num = Math.max(1, Math.round(viewport_h_num));
+        render_w_num = Math.max(viewport_w_num, Math.round(render_w_num));
+        render_h_num = Math.max(viewport_h_num, Math.round(render_h_num));
+
+        return {
+            viewport_w_num: viewport_w_num,
+            viewport_h_num: viewport_h_num,
+            render_w_num: render_w_num,
+            render_h_num: render_h_num,
+            scroll_x_num: Math.max(0, Math.round(scroll_x_num)),
+            scroll_y_num: Math.max(0, Math.round(scroll_y_num))
+        };
+    }
+
+    /**
+     * Map a document-space rect to canvas pixels and crop (handles dom-to-image scale drift).
+     */
+    function crop_canvas_from_document_rect_fun(full_canvas, metrics_obj, doc_x_num, doc_y_num, doc_w_num, doc_h_num, out_w_num, out_h_num, iframe_doc) {
+        if (!full_canvas || !metrics_obj || !iframe_doc) {
+            return null;
+        }
+        var scale_x_num = full_canvas.width / metrics_obj.render_w_num;
+        var scale_y_num = full_canvas.height / metrics_obj.render_h_num;
+        var sx_num = Math.floor(doc_x_num * scale_x_num);
+        var sy_num = Math.floor(doc_y_num * scale_y_num);
+        var sw_num = Math.ceil(doc_w_num * scale_x_num);
+        var sh_num = Math.ceil(doc_h_num * scale_y_num);
+        sx_num = Math.max(0, Math.min(sx_num, full_canvas.width));
+        sy_num = Math.max(0, Math.min(sy_num, full_canvas.height));
+        sw_num = Math.max(0, Math.min(sw_num, full_canvas.width - sx_num));
+        sh_num = Math.max(0, Math.min(sh_num, full_canvas.height - sy_num));
+
+        var dest_w_num = Math.max(1, Math.round(out_w_num !== undefined ? out_w_num : doc_w_num));
+        var dest_h_num = Math.max(1, Math.round(out_h_num !== undefined ? out_h_num : doc_h_num));
+        var crop_canvas = iframe_doc.createElement('canvas');
+        crop_canvas.width = dest_w_num;
+        crop_canvas.height = dest_h_num;
+        if (sw_num > 0 && sh_num > 0) {
+            crop_canvas.getContext('2d').drawImage(
+                full_canvas,
+                sx_num, sy_num, sw_num, sh_num,
+                0, 0, dest_w_num, dest_h_num
+            );
+        }
+        return crop_canvas;
+    }
+
+    /**
+     * offsetParent chain position in the un-scrolled document (sticky stuck detection).
+     */
+    function get_element_layout_document_offset_fun(live_el) {
+        var top_num = 0;
+        var left_num = 0;
+        var cur_el = live_el;
+        while (cur_el) {
+            top_num += cur_el.offsetTop || 0;
+            left_num += cur_el.offsetLeft || 0;
+            cur_el = cur_el.offsetParent;
+        }
+        return {
+            top_num: top_num,
+            left_num: left_num
+        };
+    }
+
+    /**
+     * Parse a computed top/left length; sticky sites often use plain px or 0 via .top-0.
+     */
+    function parse_css_offset_to_px_num(value_txt) {
+        if (!value_txt || value_txt === 'auto') {
+            return 0;
+        }
+        var parsed_num = parseFloat(value_txt);
+        return isNaN(parsed_num) ? 0 : parsed_num;
+    }
+
+    /**
+     * True when position:sticky is actively pinned (e.g. .sticky scrolled past its in-flow slot).
+     */
+    function is_sticky_element_pinned_fun(live_el, live_cs, metrics_obj, rect_obj) {
+        var scroll_y_num = metrics_obj.scroll_y_num;
+        var scroll_x_num = metrics_obj.scroll_x_num;
+        var sticky_top_num = parse_css_offset_to_px_num(live_cs.top);
+        var sticky_left_num = parse_css_offset_to_px_num(live_cs.left);
+
+        if (scroll_y_num > 0 && live_el.classList && live_el.classList.contains('sticky')) {
+            if (rect_obj.top <= sticky_top_num + 1.5) {
+                return true;
+            }
+        }
+        if (scroll_x_num > 0 && live_el.classList && live_el.classList.contains('sticky')) {
+            if (rect_obj.left <= sticky_left_num + 1.5) {
+                return true;
+            }
+        }
+
+        var layout_offset_obj = get_element_layout_document_offset_fun(live_el);
+        var visual_top_num = scroll_y_num + rect_obj.top;
+        var visual_left_num = scroll_x_num + rect_obj.left;
+        var in_flow_viewport_top_num = layout_offset_obj.top_num - scroll_y_num;
+        var in_flow_viewport_left_num = layout_offset_obj.left_num - scroll_x_num;
+
+        var pinned_vertically_boo = scroll_y_num > 0
+            && rect_obj.top <= sticky_top_num + 1.5
+            && scroll_y_num + sticky_top_num >= layout_offset_obj.top_num - 1;
+        var pinned_horizontally_boo = scroll_x_num > 0
+            && rect_obj.left <= sticky_left_num + 1.5
+            && scroll_x_num + sticky_left_num >= layout_offset_obj.left_num - 1;
+        var shifted_from_in_flow_boo = rect_obj.top < in_flow_viewport_top_num - 1
+            || rect_obj.left < in_flow_viewport_left_num - 1;
+        var visual_differs_from_layout_boo = Math.abs(visual_top_num - layout_offset_obj.top_num) > 1.5
+            || Math.abs(visual_left_num - layout_offset_obj.left_num) > 1.5;
+
+        return pinned_vertically_boo || pinned_horizontally_boo || (shifted_from_in_flow_boo && visual_differs_from_layout_boo);
+    }
+
+    /**
+     * True when computed sticky or explicit .sticky class (Tailwind / utility sheets).
+     */
+    function is_element_sticky_positioned_fun(live_el, live_cs) {
+        var position_txt = (live_cs.position || '').trim();
+        if (position_txt === 'sticky' || position_txt === '-webkit-sticky') {
+            return true;
+        }
+        if (live_el.classList && live_el.classList.contains('sticky')) {
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Place a pinned header/nav on the clone at its live viewport position in document space.
+     */
+    function apply_pinned_absolute_position_to_clone_fun(clone_el, rect_obj, visual_top_num, visual_left_num, live_cs) {
+        clone_el.style.setProperty('position', 'absolute', 'important');
+        clone_el.style.setProperty('top', visual_top_num + 'px', 'important');
+        clone_el.style.setProperty('left', visual_left_num + 'px', 'important');
+        clone_el.style.setProperty('bottom', 'auto', 'important');
+        clone_el.style.setProperty('right', 'auto', 'important');
+        clone_el.style.setProperty('margin', '0', 'important');
+        clone_el.style.setProperty('transform', 'none', 'important');
+        clone_el.style.setProperty('-webkit-transform', 'none', 'important');
+        clone_el.style.setProperty('translate', 'none', 'important');
+        if (rect_obj.width > 0) {
+            clone_el.style.setProperty('width', rect_obj.width + 'px', 'important');
+        }
+        if (rect_obj.height > 0) {
+            clone_el.style.setProperty('min-height', rect_obj.height + 'px', 'important');
+        }
+        var z_index_txt = live_cs.zIndex;
+        if (z_index_txt && z_index_txt !== 'auto') {
+            clone_el.style.setProperty('z-index', z_index_txt, 'important');
+        }
+    }
+
+    /**
+     * Flatten frosted / translucent pinned nav backgrounds onto what sits behind them in the
+     * live preview so captures are opaque (backdrop-filter does not rasterize in dom-to-image).
+     */
+    function solidify_pinned_nav_background_for_capture_fun(live_el, clone_el, live_win, live_cs) {
+        if (!live_el || !clone_el || !live_win || !live_cs) {
+            return;
+        }
+        var bg_txt = live_cs.backgroundColor;
+        var has_backdrop_boo = has_backdrop_filter_boo(live_cs);
+        var has_semi_boo = is_semi_transparent_background_color_boo(bg_txt);
+        if (!has_backdrop_boo && !has_semi_boo) {
+            return;
+        }
+
+        var matte_txt = pick_matte_from_elements_at_point_fun(live_win, live_el);
+        if (!matte_txt) {
+            matte_txt = pick_screenshot_matte_for_element_fun(live_win, live_el, live_cs);
+        }
+
+        var min_nav_alpha_num = 0.9;
+        var capture_bg_txt = null;
+
+        if (has_semi_boo) {
+            var parts_obj = parse_rgb_color_components_fun(bg_txt);
+            if (parts_obj && parts_obj.alpha_num < min_nav_alpha_num) {
+                var boosted_bg_txt = 'rgba(' +
+                    Math.round(parts_obj.r_num) + ',' +
+                    Math.round(parts_obj.g_num) + ',' +
+                    Math.round(parts_obj.b_num) + ',' +
+                    min_nav_alpha_num + ')';
+                capture_bg_txt = composite_color_on_matte_txt(boosted_bg_txt, matte_txt);
+            } else {
+                capture_bg_txt = composite_color_on_matte_txt(bg_txt, matte_txt);
+            }
+        } else if (has_backdrop_boo) {
+            if (is_dark_matte_color_boo(matte_txt)) {
+                capture_bg_txt = composite_color_on_matte_txt('rgba(15,23,42,0.9)', matte_txt);
+            } else {
+                capture_bg_txt = composite_color_on_matte_txt('rgba(255,255,255,0.92)', matte_txt);
+            }
+        }
+
+        if (capture_bg_txt && !is_css_background_color_transparent_boo(capture_bg_txt)) {
+            clone_el.style.setProperty('background-color', capture_bg_txt, 'important');
+        }
+        if (has_backdrop_boo) {
+            clone_el.style.setProperty('backdrop-filter', 'none', 'important');
+            clone_el.style.setProperty('-webkit-backdrop-filter', 'none', 'important');
+        }
+    }
+
+    /**
+     * True when a viewport-space rect overlaps the visible preview area.
+     */
+    function rects_intersect_viewport_fun(rect_obj, viewport_w_num, viewport_h_num) {
+        if (!rect_obj || viewport_w_num < 1 || viewport_h_num < 1) {
+            return false;
+        }
+        return rect_obj.bottom > 0 && rect_obj.right > 0 && rect_obj.top < viewport_h_num && rect_obj.left < viewport_w_num;
+    }
+
+    /**
+     * Closed daisyUI/HTML dialogs stay position:fixed in the tree; hide them on the clone so
+     * they do not paint a full-viewport layer in the capture.
+     */
+    function hideClosedScreenshotDialogOnCloneFun(live_el, clone_el) {
+        if (!live_el || !clone_el || (live_el.tagName || '').toLowerCase() !== 'dialog') {
+            return;
+        }
+        if (live_el.open) {
+            return;
+        }
+        clone_el.style.setProperty('display', 'none', 'important');
+        clone_el.style.setProperty('visibility', 'hidden', 'important');
+        clone_el.style.setProperty('opacity', '0', 'important');
+        clone_el.style.setProperty('pointer-events', 'none', 'important');
+    }
+
+    /**
+     * dom-to-image renders at scroll 0; fixed/sticky paint at viewport coords in the live
+     * preview but land in the wrong document band in a full-page capture. Map them on the
+     * clone so viewport crop includes pinned headers/nav (.sticky, position:sticky, fixed).
+     */
+    function apply_viewport_pinned_position_to_clone_fun(live_el, clone_el, live_win, metrics_obj) {
+        if (!live_el || !clone_el || !live_win || !metrics_obj) {
+            return;
+        }
+        try {
+            hideClosedScreenshotDialogOnCloneFun(live_el, clone_el);
+            var live_cs = live_win.getComputedStyle(live_el);
+            var position_txt = (live_cs.position || '').trim();
+            var is_fixed_boo = position_txt === 'fixed';
+            var is_sticky_boo = is_element_sticky_positioned_fun(live_el, live_cs);
+            if (!is_fixed_boo && !is_sticky_boo) {
+                return;
+            }
+            if ((live_el.tagName || '').toLowerCase() === 'dialog' && !live_el.open) {
+                return;
+            }
+            var rect_obj = live_el.getBoundingClientRect();
+            if (!rects_intersect_viewport_fun(rect_obj, metrics_obj.viewport_w_num, metrics_obj.viewport_h_num)) {
+                return;
+            }
+            if (is_sticky_boo && !is_sticky_element_pinned_fun(live_el, live_cs, metrics_obj, rect_obj)) {
+                return;
+            }
+            var visual_top_num = metrics_obj.scroll_y_num + rect_obj.top;
+            var visual_left_num = metrics_obj.scroll_x_num + rect_obj.left;
+            apply_pinned_absolute_position_to_clone_fun(
+                clone_el,
+                rect_obj,
+                visual_top_num,
+                visual_left_num,
+                live_cs
+            );
+            solidify_pinned_nav_background_for_capture_fun(live_el, clone_el, live_win, live_cs);
+        } catch (e_pinned) {}
+    }
+
+    /**
+     * Extract @font-face blocks with balanced braces (minified CSS safe).
+     */
+    function extractFontFacesFromCss(css_txt) {
+        var result_arr = [];
+        var search_from_num = 0;
+        var lower_txt = css_txt.toLowerCase();
+        while (search_from_num < css_txt.length) {
+            var idx_num = lower_txt.indexOf('@font-face', search_from_num);
+            if (idx_num === -1) break;
+            var open_num = css_txt.indexOf('{', idx_num);
+            if (open_num === -1) break;
+            var depth_num = 1;
+            var j_num = open_num + 1;
+            while (j_num < css_txt.length && depth_num > 0) {
+                if (css_txt.charAt(j_num) === '{') depth_num++;
+                else if (css_txt.charAt(j_num) === '}') depth_num--;
+                j_num++;
+            }
+            if (depth_num === 0) {
+                result_arr.push(css_txt.substring(idx_num, j_num));
+            }
+            search_from_num = j_num;
+        }
+        return result_arr;
+    }
+
+    /**
+     * Swap a live preview <img> to an inlined data URI (drops srcset so capture stays stable).
+     */
+    function replaceImgWithDataUri(img_el, data_uri_txt) {
+        // Stash the original src/srcset once so the live preview <img> can be restored
+        // after capture. dom-to-image needs the live DOM pre-inlined to base64 to render
+        // CDN images, but leaving the live src as a data: URI leaks it into the editor —
+        // element-ref chips read el.src and would embed a huge base64 blob in the prompt.
+        if (!img_el.hasAttribute('data-screenshot-orig-stashed')) {
+            img_el.setAttribute('data-screenshot-orig-src', img_el.getAttribute('src') || '');
+            img_el.setAttribute('data-screenshot-orig-srcset', img_el.getAttribute('srcset') || '');
+            img_el.setAttribute('data-screenshot-orig-stashed', '1');
+        }
+        img_el.src = data_uri_txt;
+        img_el.removeAttribute('srcset');
+        img_el.removeAttribute('data-src');
+        img_el.removeAttribute('data-lazy-src');
+    }
+
+    /**
+     * Restore every live preview <img> whose src/srcset was pre-inlined to base64 during
+     * capture. Called once dom-to-image has finished cloning the DOM so the base64 srcs
+     * never persist in the live preview (which would otherwise poison element-ref chips
+     * and visual-edit saves with data: URIs).
+     */
+    function restoreInlinedImagesFun(iframe_doc) {
+        if (!iframe_doc) {
+            return;
+        }
+        var stashed_imgs_arr = iframe_doc.querySelectorAll('img[data-screenshot-orig-stashed]');
+        for (var i_num = 0; i_num < stashed_imgs_arr.length; i_num++) {
+            var img_el = stashed_imgs_arr[i_num];
+            var orig_src_txt = img_el.getAttribute('data-screenshot-orig-src') || '';
+            var orig_srcset_txt = img_el.getAttribute('data-screenshot-orig-srcset') || '';
+            if (orig_src_txt) {
+                img_el.setAttribute('src', orig_src_txt);
+            }
+            if (orig_srcset_txt) {
+                img_el.setAttribute('srcset', orig_srcset_txt);
+            }
+            img_el.removeAttribute('data-screenshot-orig-src');
+            img_el.removeAttribute('data-screenshot-orig-srcset');
+            img_el.removeAttribute('data-screenshot-orig-stashed');
+        }
+    }
+
+    /**
+     * Proxy-fetch every document <img> into data URIs before dom-to-image-more runs so
+     * cross-origin CDN photos (f-static) appear in the thumbnail instead of placeholders.
+     */
+    function preinlineDocumentImagesForCaptureFun(iframe_doc, iframe_win) {
+        var images_arr = Array.prototype.slice.call(iframe_doc.querySelectorAll('img'));
+        if (!images_arr.length) {
+            return Promise.resolve();
+        }
+        return Promise.all(images_arr.map(function(img_el) {
+            return inlineImgViaCorsCanvas(img_el, iframe_doc, iframe_win);
+        }));
+    }
+
+    /**
+     * Inline computed CSS background-image URLs on visible nodes (hero panels, etc.).
+     * dom-to-image-more may not proxy-fetch CDN backgrounds reliably during SVG serialization.
+     */
+    function preinlineDocumentBackgroundImagesForCaptureFun(iframe_doc, iframe_win) {
+        var viewport_w_num = iframe_win.innerWidth || iframe_doc.documentElement.clientWidth || 0;
+        var viewport_h_num = iframe_win.innerHeight || iframe_doc.documentElement.clientHeight || 0;
+        var inline_promises_arr = [];
+        var seen_url_obj = {};
+        iframe_doc.querySelectorAll('*').forEach(function(el) {
+            try {
+                var rect_obj = el.getBoundingClientRect();
+                if (!rects_intersect_viewport_fun(rect_obj, viewport_w_num, viewport_h_num)) {
+                    return;
+                }
+                var cs_obj = iframe_win.getComputedStyle(el);
+                var bg_txt = cs_obj.getPropertyValue('background-image');
+                if (!bg_txt || bg_txt === 'none') {
+                    return;
+                }
+                extractImageUrlsFromCssValueTxt(bg_txt).forEach(function(url_txt) {
+                    if (isScreenshotInlineResourceUrlBoo(url_txt) || seen_url_obj[url_txt]) {
+                        return;
+                    }
+                    seen_url_obj[url_txt] = true;
+                    inline_promises_arr.push(
+                        fetchAsDataUriWithParentFallback(iframe_win, url_txt).then(function(data_uri_txt) {
+                            if (!data_uri_txt) {
+                                return;
+                            }
+                            if (data_uri_txt.length > SCREENSHOT_MAX_PREINLINE_BG_DATA_URI_LEN_NUM) {
+                                return;
+                            }
+                            var escaped_url_txt = url_txt.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                            var next_bg_txt = bg_txt
+                                .replace(new RegExp('url\\(["\']?' + escaped_url_txt + '["\']?\\)', 'g'), 'url("' + data_uri_txt + '")');
+                            if (next_bg_txt === bg_txt) {
+                                next_bg_txt = 'url("' + data_uri_txt + '")';
+                            }
+                            if (next_bg_txt.length > SCREENSHOT_MAX_PREINLINE_BG_DATA_URI_LEN_NUM) {
+                                return;
+                            }
+                            el.style.backgroundImage = next_bg_txt;
+                        })
+                    );
+                });
+            } catch (e_bg_inline) {}
+        });
+        return inline_promises_arr.length ? Promise.all(inline_promises_arr) : Promise.resolve();
+    }
+
+    /**
+     * Second-chance inline: reload image with crossOrigin so drawImage + toDataURL works.
+     */
+    function inlineImgViaCorsCanvas(img, iframe_doc, iframe_win) {
+        return new Promise(function(resolve) {
+            var src_txt = img.currentSrc || img.src || img.getAttribute('src') || '';
+            if (!src_txt || src_txt.indexOf('data:') === 0 || src_txt.indexOf('blob:') === 0) {
+                resolve();
+                return;
+            }
+
+            var finish_boo = false;
+            function try_fetch_inline_fun() {
+                if (finish_boo) {
+                    return;
+                }
+                finish_boo = true;
+                fetchAsDataUriWithParentFallback(iframe_win, src_txt).then(function(data_uri_txt) {
+                    if (data_uri_txt) {
+                        replaceImgWithDataUri(img, data_uri_txt);
+                    }
+                    resolve();
+                });
+            }
+
+            // f-static CDN has no CORS — crossOrigin reload always fails and spams the network tab.
+            if (isUrlServedByScreenshotProxy(src_txt)) {
+                try_fetch_inline_fun();
+                return;
+            }
+
+            var loader_img = new iframe_win.Image();
+            loader_img.crossOrigin = 'anonymous';
+            loader_img.onload = function() {
+                try {
+                    var cvs = iframe_doc.createElement('canvas');
+                    cvs.width = loader_img.naturalWidth;
+                    cvs.height = loader_img.naturalHeight;
+                    cvs.getContext('2d').drawImage(loader_img, 0, 0);
+                    replaceImgWithDataUri(img, cvs.toDataURL('image/png'));
+                    finish_boo = true;
+                    resolve();
+                } catch (e) {
+                    try_fetch_inline_fun();
+                }
+            };
+            loader_img.onerror = function() {
+                try_fetch_inline_fun();
+            };
+            loader_img.src = src_txt;
+        });
+    }
+
+    /**
+     * foreignObject SVG serialization never paints <video>: the picture is a decoded
+     * media surface owned by the compositor, not DOM content, so there is no resource
+     * URL for requestInterceptor/filterUrls to inline and the element always rasterizes
+     * as an empty (black) box.
+     *
+     * Fix: before dom-to-image-more runs, insert an <img> stand-in holding a still frame
+     * next to each <video> and hide the video itself. restoreCapturedVideosFun reverts
+     * the live preview once cloning is done.
+     */
+    function preinlineDocumentVideosForCaptureFun(iframe_doc, iframe_win) {
+        var videos_arr = Array.prototype.slice.call(iframe_doc.querySelectorAll('video'));
+        if (!videos_arr.length) {
+            return Promise.resolve();
+        }
+        return Promise.all(videos_arr.map(function(video_el) {
+            return grabVideoFrameDataUriTxt(iframe_doc, iframe_win, video_el).then(function(frame_data_uri_txt) {
+                if (!frame_data_uri_txt || !video_el.parentNode) {
+                    return;
+                }
+                var img_el = iframe_doc.createElement('img');
+                img_el.setAttribute(SCREENSHOT_VIDEO_STANDIN_ATTR_TXT, '1');
+                img_el.src = frame_data_uri_txt;
+                copyComputedStylesToVideoStandInFun(iframe_win, video_el, img_el);
+                video_el.setAttribute(SCREENSHOT_VIDEO_HIDDEN_ATTR_TXT, '1');
+                video_el.style.setProperty('display', 'none', 'important');
+                video_el.parentNode.insertBefore(img_el, video_el);
+            }).catch(function() {
+                // A single unreadable video must never fail the whole capture.
+            });
+        }));
+    }
+
+    /**
+     * Grab the currently decoded frame through a canvas.
+     *
+     * Cross-origin media without CORS headers taints the canvas, so toDataURL throws
+     * SecurityError — that is the normal path for f-static / s123-cdn videos and cannot
+     * be worked around client-side. Fall back to the poster image, which goes through
+     * the same proxy as every other CDN asset.
+     */
+    function grabVideoFrameDataUriTxt(iframe_doc, iframe_win, video_el) {
+        return waitForVideoFrameReadyFun(iframe_win, video_el).then(function() {
+            try {
+                if (video_el.readyState < 2 || !video_el.videoWidth || !video_el.videoHeight) {
+                    throw new Error('video_frame_not_ready');
+                }
+                var cvs_el = iframe_doc.createElement('canvas');
+                cvs_el.width = video_el.videoWidth;
+                cvs_el.height = video_el.videoHeight;
+                cvs_el.getContext('2d').drawImage(video_el, 0, 0);
+                return cvs_el.toDataURL('image/png');
+            } catch (e_frame) {
+                var poster_txt = video_el.getAttribute('poster') || '';
+                if (!poster_txt) {
+                    return null;
+                }
+                return fetchAsDataUriWithParentFallback(iframe_win, poster_txt);
+            }
+        });
+    }
+
+    /**
+     * readyState >= 2 (HAVE_CURRENT_DATA) means a frame is decoded and drawable to canvas.
+     * A muted play() nudge is needed for videos that never autoplayed in the preview;
+     * the timeout keeps a stalled or codec-unsupported video from blocking capture.
+     */
+    function waitForVideoFrameReadyFun(iframe_win, video_el) {
+        if (video_el.readyState >= 2) {
+            return Promise.resolve();
+        }
+        return new Promise(function(resolve) {
+            var done_boo = false;
+            function finish_fun() {
+                if (done_boo) {
+                    return;
+                }
+                done_boo = true;
+                resolve();
+            }
+            video_el.addEventListener('loadeddata', finish_fun, { once: true });
+            try {
+                video_el.muted = true;
+                var play_promise_obj = video_el.play();
+                if (play_promise_obj && play_promise_obj.catch) {
+                    play_promise_obj.catch(function() {});
+                }
+            } catch (e_play) {}
+            iframe_win.setTimeout(finish_fun, SCREENSHOT_VIDEO_FRAME_TIMEOUT_MS_NUM);
+        });
+    }
+
+    /**
+     * The stand-in <img> must occupy the video's exact box. Background/hero videos are
+     * typically position:absolute + inset-0 + object-fit:cover, which a default-flow
+     * <img> would not reproduce, so the geometry-affecting computed styles are copied.
+     */
+    function copyComputedStylesToVideoStandInFun(iframe_win, video_el, img_el) {
+        try {
+            var cs_obj = iframe_win.getComputedStyle(video_el);
+            for (var i_num = 0; i_num < SCREENSHOT_VIDEO_COPY_PROPS_ARR.length; i_num++) {
+                var prop_txt = SCREENSHOT_VIDEO_COPY_PROPS_ARR[i_num];
+                var val_txt = cs_obj[prop_txt];
+                if (!val_txt || val_txt === 'auto' || val_txt === 'none' || val_txt === 'normal') {
+                    continue;
+                }
+                img_el.style[prop_txt] = val_txt;
+            }
+            img_el.style.display = 'block';
+        } catch (e_copy) {}
+    }
+
+    /**
+     * Mirror of restoreInlinedImagesFun for video stand-ins: drop the temporary <img>
+     * nodes and un-hide the real <video> elements so the live preview is untouched.
+     */
+    function restoreCapturedVideosFun(iframe_doc) {
+        if (!iframe_doc) {
+            return;
+        }
+        var standins_arr = iframe_doc.querySelectorAll('img[' + SCREENSHOT_VIDEO_STANDIN_ATTR_TXT + ']');
+        for (var i_num = 0; i_num < standins_arr.length; i_num++) {
+            var standin_el = standins_arr[i_num];
+            if (standin_el.parentNode) {
+                standin_el.parentNode.removeChild(standin_el);
+            }
+        }
+        var hidden_videos_arr = iframe_doc.querySelectorAll('video[' + SCREENSHOT_VIDEO_HIDDEN_ATTR_TXT + ']');
+        for (var v_num = 0; v_num < hidden_videos_arr.length; v_num++) {
+            var video_el = hidden_videos_arr[v_num];
+            video_el.style.removeProperty('display');
+            video_el.removeAttribute(SCREENSHOT_VIDEO_HIDDEN_ATTR_TXT);
+        }
+    }
+
+    /**
+     * Lowercase font-family names referenced by visible preview nodes (skip unused @font-face downloads).
+     */
+    function getScreenshotUsedFontFamilyNamesSetFun(iframe_doc) {
+        var names_obj = {};
+        var iframe_win = iframe_doc && iframe_doc.defaultView;
+        if (!iframe_win) {
+            return names_obj;
+        }
+        function add_families_from_font_family_txt(font_family_txt) {
+            if (!font_family_txt) {
+                return;
+            }
+            font_family_txt.split(',').forEach(function(part_txt) {
+                var name_txt = part_txt.trim().replace(/^["']|["']$/g, '').toLowerCase();
+                if (name_txt && name_txt !== 'inherit') {
+                    names_obj[name_txt] = true;
+                }
+            });
+        }
+        add_families_from_font_family_txt(
+            iframe_win.getComputedStyle(iframe_doc.documentElement).fontFamily
+        );
+        if (iframe_doc.body) {
+            add_families_from_font_family_txt(
+                iframe_win.getComputedStyle(iframe_doc.body).fontFamily
+            );
+            var node_list = iframe_doc.body.querySelectorAll('*');
+            for (var i_num = 0; i_num < node_list.length; i_num++) {
+                var tag_txt = (node_list[i_num].tagName || '').toLowerCase();
+                if (tag_txt === 'script' || tag_txt === 'style' || tag_txt === 'noscript' || tag_txt === 'svg') {
+                    continue;
+                }
+                add_families_from_font_family_txt(
+                    iframe_win.getComputedStyle(node_list[i_num]).fontFamily
+                );
+            }
+        }
+        return names_obj;
+    }
+
+    /**
+     * True when an @font-face block belongs to Font Awesome (handled by buildFontAwesomeFallbackCssTxtFun).
+     */
+    function isFontAwesomeFontFaceRuleBoo(rule_txt) {
+        return /font\s*awesome/i.test(rule_txt);
+    }
+
+    /**
+     * True when the @font-face family is used somewhere in the live preview DOM.
+     */
+    function fontFaceRuleMatchesUsedFamilyBoo(rule_txt, used_names_obj) {
+        var fam_match_arr = rule_txt.match(/font-family\s*:\s*([^;}+]+)/i);
+        if (!fam_match_arr) {
+            return true;
+        }
+        var parts_arr = fam_match_arr[1].split(',');
+        for (var i_num = 0; i_num < parts_arr.length; i_num++) {
+            var name_txt = parts_arr[i_num].trim().replace(/^["']|["']$/g, '').toLowerCase();
+            if (used_names_obj[name_txt]) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Unicode code points of the visible preview text (body text plus form placeholders / values).
+     * Used to keep only the webfont subsets (latin, hebrew, arabic, ...) the capture really draws.
+     */
+    function getScreenshotUsedCodePointsArrFun(iframe_doc) {
+        var code_points_obj = {};
+        if (!iframe_doc || !iframe_doc.body) {
+            return [];
+        }
+        var text_parts_arr = [iframe_doc.body.textContent || ''];
+        // Placeholders and input values are drawn by the browser but are not part of textContent
+        var field_list = iframe_doc.body.querySelectorAll('input, textarea');
+        for (var field_index_num = 0; field_index_num < field_list.length; field_index_num++) {
+            text_parts_arr.push(field_list[field_index_num].getAttribute('placeholder') || '');
+            text_parts_arr.push(field_list[field_index_num].value || '');
+        }
+        var all_text_txt = text_parts_arr.join(' ');
+        for (var char_index_num = 0; char_index_num < all_text_txt.length; char_index_num++) {
+            var code_point_num = all_text_txt.codePointAt(char_index_num);
+            code_points_obj[code_point_num] = true;
+            // Astral characters (emoji, rare scripts) use two UTF-16 units - skip the second half
+            if (code_point_num > 0xFFFF) {
+                char_index_num++;
+            }
+        }
+        return Object.keys(code_points_obj).map(Number);
+    }
+
+    /**
+     * True when an @font-face block has no unicode-range (full font) or its range covers
+     * at least one code point drawn on the page. Handles `U+0590-05FF`, `U+20AA` and `U+4??`.
+     */
+    function fontFaceRuleCoversUsedCodePointsBoo(rule_txt, used_code_points_arr) {
+        var range_match_arr = String(rule_txt).match(/unicode-range\s*:\s*([^;}]+)/i);
+        if (!range_match_arr) {
+            return true;
+        }
+        var range_parts_arr = range_match_arr[1].split(',');
+        for (var part_index_num = 0; part_index_num < range_parts_arr.length; part_index_num++) {
+            var range_txt = range_parts_arr[part_index_num].trim().replace(/^u\+/i, '');
+            var bounds_arr = range_txt.split('-');
+            var start_num = parseInt(bounds_arr[0].replace(/\?/g, '0'), 16);
+            var end_num = (bounds_arr.length > 1)
+                ? parseInt(bounds_arr[1], 16)
+                : parseInt(bounds_arr[0].replace(/\?/g, 'f'), 16);
+            if (isNaN(start_num) || isNaN(end_num)) {
+                continue;
+            }
+            for (var code_index_num = 0; code_index_num < used_code_points_arr.length; code_index_num++) {
+                if (used_code_points_arr[code_index_num] >= start_num && used_code_points_arr[code_index_num] <= end_num) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Inline all @font-face rules (including from cross-origin sheets like
+     * Font Awesome CDN) as base64 so they survive foreignObject SVG serialization.
+     * Returns the injected <style> element for cleanup, or null.
+     */
+    function inlineFontFaces(iframe_doc, iframe_win) {
+        var font_face_css_arr = [];
+        var fetch_sheet_promises_arr = [];
+
+        try {
+            var sheets = iframe_doc.styleSheets;
+            for (var i = 0; i < sheets.length; i++) {
+                try {
+                    var rules = sheets[i].cssRules;
+                    if (!rules) continue;
+                    for (var j = 0; j < rules.length; j++) {
+                        if (rules[j] instanceof CSSFontFaceRule) {
+                            font_face_css_arr.push(rules[j].cssText);
+                        }
+                    }
+                } catch(e) {
+                    if (sheets[i].href) {
+                        (function(sheet_href) {
+                            fetch_sheet_promises_arr.push(
+                                iframe_win.fetch(sheet_href, { mode: 'cors' })
+                                    .then(function(r) { return r.text(); })
+                                    .then(function(css_txt) {
+                                        var matches = extractFontFacesFromCss(css_txt);
+                                        if (!matches.length) return;
+                                        matches.forEach(function(rule_txt) {
+                                            var resolved_txt = rule_txt.replace(
+                                                /url\(['"]?([^'")\s]+)['"]?\)/gi,
+                                                function(full, rel_url) {
+                                                    if (rel_url.indexOf('data:') === 0) return full;
+                                                    try {
+                                                        return 'url("' + new URL(rel_url, sheet_href).href + '")';
+                                                    } catch(e2) { return full; }
+                                                }
+                                            );
+                                            font_face_css_arr.push(resolved_txt);
+                                        });
+                                    })
+                                    .catch(function() {})
+                            );
+                        })(sheets[i].href);
+                    }
+                }
+            }
+        } catch(e) {}
+
+        return Promise.all(fetch_sheet_promises_arr).then(function() {
+            if (!font_face_css_arr.length) {
+                return null;
+            }
+
+            var skip_fa_font_faces_boo = !!iframe_doc.querySelector(
+                '.fa, .fas, .far, .fab, .fal, .fad, .fass, .fa-solid, .fa-regular, .fa-brands'
+            );
+            var used_family_names_obj = getScreenshotUsedFontFamilyNamesSetFun(iframe_doc);
+            var filtered_rules_arr = [];
+            font_face_css_arr.forEach(function(rule_txt) {
+                if (skip_fa_font_faces_boo && isFontAwesomeFontFaceRuleBoo(rule_txt)) {
+                    return;
+                }
+                if (!fontFaceRuleMatchesUsedFamilyBoo(rule_txt, used_family_names_obj)) {
+                    return;
+                }
+                filtered_rules_arr.push(rule_txt);
+            });
+            if (!filtered_rules_arr.length) {
+                return null;
+            }
+
+            /**
+             * Cross-origin webfonts (Google Fonts, etc.) ship one @font-face block per subset
+             * (latin, latin-ext, hebrew, cyrillic, greek, vietnamese, ...). Inlining every subset
+             * as base64 bloats the foreignObject SVG past the browser's rasterization limit
+             * (observed ~3.2MB of fonts -> 4.2MB SVG -> rasterize fails), so keep only blocks
+             * whose unicode-range covers characters on the page (plus full fonts with no range).
+             * A dropped subset makes that script render in a wider fallback font, and the text
+             * overflows boxes sized for the real font (e.g. Hebrew buttons wrapping to two lines).
+             * Fall back to the full set only if filtering removed everything.
+             */
+            var used_code_points_arr = getScreenshotUsedCodePointsArrFun(iframe_doc);
+            var used_subset_rules_arr = filtered_rules_arr.filter(function(rule_txt) {
+                return fontFaceRuleCoversUsedCodePointsBoo(rule_txt, used_code_points_arr);
+            });
+            if (used_subset_rules_arr.length) {
+                filtered_rules_arr = used_subset_rules_arr;
+            }
+
+            var unique_urls_obj = {};
+            filtered_rules_arr.forEach(function(rule_txt) {
+                var url_regex = /url\(['"]?([^'")\s]+)['"]?\)/gi;
+                var match;
+                while ((match = url_regex.exec(rule_txt)) !== null) {
+                    if (match[1].indexOf('data:') !== 0) {
+                        unique_urls_obj[match[1]] = true;
+                    }
+                }
+            });
+            var unique_urls_arr = Object.keys(unique_urls_obj);
+
+            return Promise.all(unique_urls_arr.map(function(url_txt) {
+                return fetchAsDataUriWithParentFallback(iframe_win, url_txt).then(function(data_uri_txt) {
+                    return { url: url_txt, dataUri: data_uri_txt };
+                });
+            })).then(function(url_results_arr) {
+                var url_map_obj = {};
+                url_results_arr.forEach(function(result_obj) {
+                    if (result_obj.dataUri) {
+                        url_map_obj[result_obj.url] = result_obj.dataUri;
+                    }
+                });
+                var inlined_rules_arr = filtered_rules_arr.map(function(rule_txt) {
+                    var inlined_txt = rule_txt;
+                    unique_urls_arr.forEach(function(url_txt) {
+                        if (url_map_obj[url_txt]) {
+                            inlined_txt = inlined_txt.split(url_txt).join(url_map_obj[url_txt]);
+                        }
+                    });
+                    return inlined_txt;
+                });
+                var final_font_css_txt = inlined_rules_arr.join('\n');
+
+                // Hard backstop: if the inlined font payload is still too large to keep the
+                // foreignObject SVG rasterizable, skip webfont inlining entirely so the capture
+                // succeeds with fallback fonts instead of failing outright.
+                var MAX_INLINE_FONT_CSS_BYTES_NUM = 1500000;
+
+                if (final_font_css_txt.length > MAX_INLINE_FONT_CSS_BYTES_NUM) {
+                    return null;
+                }
+                return final_font_css_txt;
+            });
+        });
+    }
+
+    function is_css_background_color_transparent_boo(bg_txt) {
+        var t = (bg_txt || '').trim().toLowerCase();
+        if (
+            !t ||
+            t === 'transparent' ||
+            t === 'rgba(0, 0, 0, 0)' ||
+            t === 'rgba(0,0,0,0)'
+        ) {
+            return true;
+        }
+        var parts_obj = parse_rgb_color_components_fun(bg_txt);
+        return !!(parts_obj && parts_obj.alpha_num < 0.01);
+    }
+
+    /**
+     * True when computed background-color has meaningful alpha below 1.
+     */
+    function is_semi_transparent_background_color_boo(bg_txt) {
+        if (is_css_background_color_transparent_boo(bg_txt)) {
+            return false;
+        }
+        var parts_obj = parse_rgb_color_components_fun(bg_txt);
+        if (!parts_obj) {
+            return false;
+        }
+        return parts_obj.alpha_num < 0.98;
+    }
+
+    /**
+     * Parse rgb/rgba into components; returns null when not a rgb() form.
+     */
+    function parse_rgb_color_components_fun(color_txt) {
+        var trimmed_txt = (color_txt || '').trim();
+        var comma_match_arr = trimmed_txt.match(
+            /rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)\s*(?:,\s*([\d.]+)\s*)?\)/i
+        );
+        if (comma_match_arr) {
+            return {
+                r_num: parseFloat(comma_match_arr[1]),
+                g_num: parseFloat(comma_match_arr[2]),
+                b_num: parseFloat(comma_match_arr[3]),
+                alpha_num: comma_match_arr[4] !== undefined ? parseFloat(comma_match_arr[4]) : 1
+            };
+        }
+        var space_match_arr = trimmed_txt.match(
+            /rgba?\(\s*([\d.]+)\s+([\d.]+)\s+([\d.]+)(?:\s*\/\s*([\d.]+))?\s*\)/i
+        );
+        if (space_match_arr) {
+            return {
+                r_num: parseFloat(space_match_arr[1]),
+                g_num: parseFloat(space_match_arr[2]),
+                b_num: parseFloat(space_match_arr[3]),
+                alpha_num: space_match_arr[4] !== undefined ? parseFloat(space_match_arr[4]) : 1
+            };
+        }
+        return null;
+    }
+
+    /**
+     * Flatten a translucent fill onto an opaque matte (ancestor page bg, not always white).
+     */
+    function composite_color_on_matte_txt(color_txt, matte_txt) {
+        var fg_parts_obj = parse_rgb_color_components_fun(color_txt);
+        if (!fg_parts_obj) {
+            return (color_txt || '').trim();
+        }
+        if (fg_parts_obj.alpha_num >= 0.998) {
+            return 'rgb(' + Math.round(fg_parts_obj.r_num) + ',' + Math.round(fg_parts_obj.g_num) + ',' + Math.round(fg_parts_obj.b_num) + ')';
+        }
+        var matte_parts_obj = parse_rgb_color_components_fun(matte_txt);
+        var matte_r_num = matte_parts_obj ? matte_parts_obj.r_num : 255;
+        var matte_g_num = matte_parts_obj ? matte_parts_obj.g_num : 255;
+        var matte_b_num = matte_parts_obj ? matte_parts_obj.b_num : 255;
+        var alpha_num = fg_parts_obj.alpha_num;
+        var out_r_num = Math.round(alpha_num * fg_parts_obj.r_num + (1 - alpha_num) * matte_r_num);
+        var out_g_num = Math.round(alpha_num * fg_parts_obj.g_num + (1 - alpha_num) * matte_g_num);
+        var out_b_num = Math.round(alpha_num * fg_parts_obj.b_num + (1 - alpha_num) * matte_b_num);
+        return 'rgb(' + out_r_num + ',' + out_g_num + ',' + out_b_num + ')';
+    }
+
+    function composite_color_on_white_txt(color_txt) {
+        return composite_color_on_matte_txt(color_txt, '#ffffff');
+    }
+
+    /**
+     * White/light glass fills (bg-white/80, frosted nav) — flattening onto a colored gradient matte
+     * tints them cream/yellow; keep them white in captures instead.
+     * Low-alpha white tints (bg-white/5 on dark glass) must stay on a dark matte.
+     */
+    function is_light_semi_transparent_fill_boo(bg_txt) {
+        var parts_obj = parse_rgb_color_components_fun(bg_txt);
+        if (!parts_obj || parts_obj.alpha_num >= 0.998) {
+            return false;
+        }
+        if (parts_obj.alpha_num < 0.35) {
+            return false;
+        }
+        if (parts_obj.r_num >= 235 && parts_obj.g_num >= 235 && parts_obj.b_num >= 235) {
+            return true;
+        }
+        var lum_num = (0.299 * parts_obj.r_num + 0.587 * parts_obj.g_num + 0.114 * parts_obj.b_num) / 255;
+        return lum_num >= 0.88;
+    }
+
+    function is_dark_matte_color_boo(color_txt) {
+        var lum_num = rgb_string_luminance_num(color_txt);
+        return lum_num >= 0 && lum_num < 0.45;
+    }
+
+    /**
+     * Approximate frosted glass after backdrop-filter is stripped (light UI only).
+     * Dark glass keeps the live rgba stack — synthetic white frost reads as a milky overlay.
+     */
+    function resolve_backdrop_glass_background_for_capture_txt(matte_txt) {
+        if (is_dark_matte_color_boo(matte_txt)) {
+            return null;
+        }
+        return composite_color_on_matte_txt('rgba(255,255,255,0.72)', matte_txt);
+    }
+
+    /**
+     * Resolve a translucent background-color for capture without tinting white surfaces.
+     */
+    function resolve_semi_transparent_background_for_capture_txt(bg_txt, matte_txt, live_win) {
+        if (live_win && (matte_txt === '#ffffff' || !matte_txt || is_css_background_color_transparent_boo(matte_txt))) {
+            var theme_matte_txt = pick_theme_matte_from_css_variables_fun(live_win);
+            if (theme_matte_txt) {
+                matte_txt = theme_matte_txt;
+            }
+        }
+        if (is_dark_matte_color_boo(matte_txt)) {
+            return (bg_txt || '').trim();
+        }
+        if (is_light_semi_transparent_fill_boo(bg_txt)) {
+            var parts_obj = parse_rgb_color_components_fun(bg_txt);
+            if (parts_obj && parts_obj.alpha_num >= 0.72) {
+                return 'rgb(' + Math.round(parts_obj.r_num) + ',' + Math.round(parts_obj.g_num) + ',' + Math.round(parts_obj.b_num) + ')';
+            }
+            return composite_color_on_white_txt(bg_txt);
+        }
+        return composite_color_on_matte_txt(bg_txt, matte_txt);
+    }
+
+    /**
+     * True when the element's visible fill is a CSS gradient layer.
+     */
+    function has_capture_gradient_background_boo(live_cs) {
+        var bg_image_txt = (live_cs.getPropertyValue('background-image') || '').trim();
+        return bg_image_txt !== 'none' && bg_image_txt.indexOf('gradient') !== -1;
+    }
+
+    /**
+     * Resolve var(--token) using computed :root/body values for capture clones.
+     */
+    function resolve_css_color_token_for_capture_txt(live_win, token_txt) {
+        var trimmed_txt = (token_txt || '').trim();
+        if (!trimmed_txt || trimmed_txt.indexOf('var(') !== 0 || !live_win || !live_win.document) {
+            return trimmed_txt;
+        }
+        var var_match_arr = trimmed_txt.match(/var\(\s*(--[^,\s)]+)/);
+        if (!var_match_arr) {
+            return trimmed_txt;
+        }
+        var var_name_txt = var_match_arr[1];
+        var var_val_txt = live_win.getComputedStyle(live_win.document.documentElement).getPropertyValue(var_name_txt).trim();
+        if (!var_val_txt && live_win.document.body) {
+            var_val_txt = live_win.getComputedStyle(live_win.document.body).getPropertyValue(var_name_txt).trim();
+        }
+        return var_val_txt || trimmed_txt;
+    }
+
+    /**
+     * Expand color-mix(..., transparent) to rgba() — foreignObject capture cannot paint color-mix().
+     */
+    function resolve_color_mix_expression_for_capture_txt(live_win, color_mix_txt) {
+        var match_arr = (color_mix_txt || '').match(
+            /color-mix\s*\(\s*in\s+srgb\s*,\s*([^,]+?)\s+([\d.]+)\s*%\s*,\s*transparent\s*\)/i
+        );
+        if (!match_arr) {
+            return color_mix_txt;
+        }
+        var base_color_txt = resolve_css_color_token_for_capture_txt(live_win, match_arr[1].trim());
+        var parts_obj = parse_rgb_color_components_fun(base_color_txt);
+        if (!parts_obj) {
+            return color_mix_txt;
+        }
+        var alpha_num = parseFloat(match_arr[2]) / 100;
+        return 'rgba(' + Math.round(parts_obj.r_num) + ',' + Math.round(parts_obj.g_num) + ',' + Math.round(parts_obj.b_num) + ',' + alpha_num + ')';
+    }
+
+    /**
+     * Replace every color-mix() stop inside a computed background-image gradient string.
+     */
+    function resolve_color_mix_in_background_image_for_capture_txt(live_win, bg_image_txt) {
+        if (!bg_image_txt || bg_image_txt.indexOf('color-mix') === -1) {
+            return bg_image_txt;
+        }
+        var resolved_txt = bg_image_txt;
+        var mix_re = /color-mix\([^)]+\)/gi;
+        var mix_match_arr;
+        while ((mix_match_arr = mix_re.exec(bg_image_txt)) !== null) {
+            var mix_expr_txt = mix_match_arr[0];
+            var rgba_stop_txt = resolve_color_mix_expression_for_capture_txt(live_win, mix_expr_txt);
+            resolved_txt = resolved_txt.split(mix_expr_txt).join(rgba_stop_txt);
+        }
+        return resolved_txt;
+    }
+
+    /**
+     * Last resort: ask the live browser to serialize background-image without color-mix().
+     */
+    function resolve_live_background_image_with_probe_fun(live_doc, live_win, bg_image_txt) {
+        if (!live_doc || !live_win || !bg_image_txt || bg_image_txt === 'none') {
+            return bg_image_txt;
+        }
+        var probe_el = live_doc.createElement('div');
+        probe_el.setAttribute('data-screenshot-bg-probe', 'true');
+        probe_el.style.setProperty('position', 'fixed', 'important');
+        probe_el.style.setProperty('left', '-10000px', 'important');
+        probe_el.style.setProperty('width', '1px', 'important');
+        probe_el.style.setProperty('height', '1px', 'important');
+        probe_el.style.setProperty('opacity', '0', 'important');
+        probe_el.style.setProperty('pointer-events', 'none', 'important');
+        probe_el.style.setProperty('background-image', bg_image_txt);
+        var root_el = live_doc.documentElement;
+        root_el.appendChild(probe_el);
+        var resolved_txt = (live_win.getComputedStyle(probe_el).backgroundImage || '').trim();
+        root_el.removeChild(probe_el);
+        if (resolved_txt && resolved_txt !== 'none' && resolved_txt.indexOf('color-mix') === -1) {
+            return resolved_txt;
+        }
+        return bg_image_txt;
+    }
+
+    /**
+     * Inline a capture-safe gradient on the clone (rgba stops instead of color-mix/var()).
+     */
+    function sync_capture_gradient_background_to_clone_fun(live_win, live_cs, clone_el) {
+        var bg_image_txt = (live_cs.getPropertyValue('background-image') || '').trim();
+        if (!bg_image_txt || bg_image_txt === 'none') {
+            return;
+        }
+        var resolved_bg_img_txt = bg_image_txt;
+        if (bg_image_txt.indexOf('color-mix') !== -1 || bg_image_txt.indexOf('var(') !== -1) {
+            resolved_bg_img_txt = resolve_color_mix_in_background_image_for_capture_txt(live_win, bg_image_txt);
+            if (resolved_bg_img_txt.indexOf('color-mix') !== -1 && live_win.document) {
+                resolved_bg_img_txt = resolve_live_background_image_with_probe_fun(
+                    live_win.document,
+                    live_win,
+                    resolved_bg_img_txt
+                );
+            }
+        }
+        clone_el.style.setProperty('background-image', resolved_bg_img_txt, 'important');
+        clone_el.style.setProperty('background-color', 'transparent', 'important');
+        var bg_size_txt = live_cs.getPropertyValue('background-size');
+        if (bg_size_txt) {
+            clone_el.style.setProperty('background-size', bg_size_txt, 'important');
+        }
+        var bg_position_txt = live_cs.getPropertyValue('background-position');
+        if (bg_position_txt) {
+            clone_el.style.setProperty('background-position', bg_position_txt, 'important');
+        }
+        var bg_repeat_txt = live_cs.getPropertyValue('background-repeat');
+        if (bg_repeat_txt) {
+            clone_el.style.setProperty('background-repeat', bg_repeat_txt, 'important');
+        }
+    }
+
+    /**
+     * Theme tokens from :root that usually define the page canvas color on AI-built apps.
+     */
+    function pick_theme_matte_from_css_variables_fun(live_win) {
+        if (!live_win || !live_win.document) {
+            return null;
+        }
+        try {
+            var root_cs = live_win.getComputedStyle(live_win.document.documentElement);
+            var var_names_arr = [
+                '--background-color',
+            ];
+            for (var vi_num = 0; vi_num < var_names_arr.length; vi_num++) {
+                var raw_txt = root_cs.getPropertyValue(var_names_arr[vi_num]).trim();
+                if (!raw_txt) {
+                    continue;
+                }
+                var resolved_txt = resolve_css_color_token_for_capture_txt(live_win, raw_txt);
+                if (resolved_txt && !is_css_background_color_transparent_boo(resolved_txt)) {
+                    return resolved_txt;
+                }
+            }
+        } catch (e_theme) {}
+        return null;
+    }
+
+    /**
+     * Canvas bgcolor for dom-to-image-more — must match the page, not hardcoded white.
+     */
+    function pick_screenshot_capture_bgcolor_txt(iframe_win) {
+        var page_matte_txt = pick_screenshot_page_fallback_matte_fun(iframe_win);
+        if (page_matte_txt) {
+            return page_matte_txt;
+        }
+        return '#ffffff';
+    }
+
+    /**
+     * Opaque fill from one element's computed background-color or gradient image.
+     */
+    function pick_opaque_background_from_element_fun(live_win, el) {
+        if (!el || !live_win) {
+            return null;
+        }
+        try {
+            var cs_obj = live_win.getComputedStyle(el);
+            var bg_txt = cs_obj.backgroundColor;
+            if (!is_css_background_color_transparent_boo(bg_txt) && !is_semi_transparent_background_color_boo(bg_txt)) {
+                return bg_txt.trim();
+            }
+            var bg_img_txt = cs_obj.backgroundImage || '';
+            if (bg_img_txt && bg_img_txt !== 'none' && bg_img_txt.indexOf('gradient') !== -1) {
+                var gradient_fill_txt = pick_fill_color_for_clipped_gradient_txt(cs_obj, bg_img_txt);
+                if (gradient_fill_txt && !is_css_background_color_transparent_boo(gradient_fill_txt)) {
+                    return gradient_fill_txt.trim();
+                }
+            }
+        } catch (e_pick) {}
+        return null;
+    }
+
+    /**
+     * Walk up the live tree for the nearest opaque background to use as a flatten matte.
+     */
+    function pick_nearest_opaque_ancestor_background_fun(live_win, start_el) {
+        var el = start_el;
+        var depth_num = 0;
+        while (el && depth_num < 14) {
+            var picked_txt = pick_opaque_background_from_element_fun(live_win, el);
+            if (picked_txt) {
+                return picked_txt;
+            }
+            el = el.parentElement;
+            depth_num++;
+        }
+        return pick_screenshot_page_fallback_matte_fun(live_win);
+    }
+
+    /**
+     * Sample what is visually behind fixed/sticky/backdrop elements (read-only; no live DOM mutation).
+     */
+    function pick_matte_from_elements_at_point_fun(live_win, live_el) {
+        if (!live_win || !live_el || !live_win.document.elementsFromPoint) {
+            return null;
+        }
+        try {
+            var rect_obj = live_el.getBoundingClientRect();
+            var cx_num = Math.round(rect_obj.left + rect_obj.width / 2);
+            var cy_num = Math.round(rect_obj.top + Math.min(rect_obj.height * 0.35, rect_obj.height - 2));
+            if (rect_obj.width < 1 || rect_obj.height < 1) {
+                return null;
+            }
+            var stack_arr = live_win.document.elementsFromPoint(cx_num, cy_num);
+            var si_num;
+            for (si_num = 0; si_num < stack_arr.length; si_num++) {
+                var hit_el = stack_arr[si_num];
+                if (!hit_el || hit_el === live_el || live_el.contains(hit_el)) {
+                    continue;
+                }
+                var hit_matte_txt = pick_opaque_background_from_element_fun(live_win, hit_el);
+                if (hit_matte_txt) {
+                    return hit_matte_txt;
+                }
+                var walk_el = hit_el.parentElement;
+                var walk_depth_num = 0;
+                while (walk_el && walk_depth_num < 6) {
+                    hit_matte_txt = pick_opaque_background_from_element_fun(live_win, walk_el);
+                    if (hit_matte_txt) {
+                        return hit_matte_txt;
+                    }
+                    walk_el = walk_el.parentElement;
+                    walk_depth_num++;
+                }
+            }
+        } catch (e_point) {}
+        return null;
+    }
+
+    /**
+     * Best matte for flattening a translucent fill: same-element gradient, visual stack, then ancestors.
+     */
+    function pick_screenshot_matte_for_element_fun(live_win, live_el, live_cs) {
+        if (!live_el || !live_cs) {
+            return pick_screenshot_page_fallback_matte_fun(live_win);
+        }
+        var bg_img_txt = live_cs.backgroundImage || '';
+        if (
+            bg_img_txt &&
+            bg_img_txt !== 'none' &&
+            bg_img_txt.indexOf('gradient') !== -1 &&
+            is_semi_transparent_background_color_boo(live_cs.backgroundColor)
+        ) {
+            var same_el_grad_txt = pick_fill_color_for_clipped_gradient_txt(live_cs, bg_img_txt);
+            if (same_el_grad_txt && !is_css_background_color_transparent_boo(same_el_grad_txt)) {
+                return same_el_grad_txt.trim();
+            }
+        }
+        var position_txt = (live_cs.position || '').trim();
+        if (
+            has_backdrop_filter_boo(live_cs) ||
+            position_txt === 'fixed' ||
+            position_txt === 'sticky' ||
+            is_semi_transparent_background_color_boo(live_cs.backgroundColor)
+        ) {
+            var point_matte_txt = pick_matte_from_elements_at_point_fun(live_win, live_el);
+            if (point_matte_txt) {
+                return point_matte_txt;
+            }
+        }
+        var ancestor_matte_txt = pick_nearest_opaque_ancestor_background_fun(live_win, live_el.parentElement);
+        if (ancestor_matte_txt === '#ffffff') {
+            var page_matte_txt = pick_screenshot_page_fallback_matte_fun(live_win);
+            if (page_matte_txt && page_matte_txt !== '#ffffff') {
+                return page_matte_txt;
+            }
+            var stack_matte_txt = pick_matte_from_elements_at_point_fun(live_win, live_el);
+            if (stack_matte_txt) {
+                return stack_matte_txt;
+            }
+        }
+        return ancestor_matte_txt;
+    }
+
+    /**
+     * Fallback matte when ancestor walk only finds transparent layers (common on dark dashboards).
+     */
+    function pick_screenshot_page_fallback_matte_fun(live_win) {
+        if (!live_win || !live_win.document) {
+            return '#ffffff';
+        }
+        var theme_matte_txt = pick_theme_matte_from_css_variables_fun(live_win);
+        if (theme_matte_txt) {
+            return theme_matte_txt;
+        }
+        var body_matte_txt = pick_opaque_background_from_element_fun(live_win, live_win.document.body);
+        if (body_matte_txt) {
+            return body_matte_txt;
+        }
+        var html_matte_txt = pick_opaque_background_from_element_fun(live_win, live_win.document.documentElement);
+        if (html_matte_txt) {
+            return html_matte_txt;
+        }
+        var section_list = live_win.document.querySelectorAll('section, main, header, footer');
+        var best_dark_matte_txt = null;
+        var si_num;
+        for (si_num = 0; si_num < section_list.length && si_num < 24; si_num++) {
+            var section_matte_txt = pick_opaque_background_from_element_fun(live_win, section_list[si_num]);
+            if (!section_matte_txt) {
+                continue;
+            }
+            var lum_num = rgb_string_luminance_num(section_matte_txt);
+            if (lum_num >= 0 && lum_num < 0.42) {
+                best_dark_matte_txt = section_matte_txt;
+                break;
+            }
+        }
+        if (best_dark_matte_txt) {
+            return best_dark_matte_txt;
+        }
+        return '#ffffff';
+    }
+
+    function has_backdrop_filter_boo(cs_obj) {
+        if (!cs_obj) {
+            return false;
+        }
+        var backdrop_txt = cs_obj.backdropFilter || cs_obj.getPropertyValue('backdrop-filter');
+        var webkit_backdrop_txt = cs_obj.getPropertyValue('-webkit-backdrop-filter');
+        return (backdrop_txt && backdrop_txt !== 'none') || (webkit_backdrop_txt && webkit_backdrop_txt !== 'none');
+    }
+
+    /**
+     * Inline a capture-safe url()-only background on the clone (size/position/repeat preserved).
+     */
+    function sync_capture_url_background_to_clone_fun(live_cs, clone_el) {
+        var bg_image_txt = (live_cs.getPropertyValue('background-image') || '').trim();
+        if (!bg_image_txt || bg_image_txt === 'none' || bg_image_txt.indexOf('url(') === -1) {
+            return;
+        }
+        if (bg_image_txt.indexOf('gradient') !== -1) {
+            return;
+        }
+        clone_el.style.setProperty('background-image', bg_image_txt, 'important');
+        var bg_size_txt = live_cs.getPropertyValue('background-size');
+        if (bg_size_txt) {
+            clone_el.style.setProperty('background-size', bg_size_txt, 'important');
+        }
+        var bg_position_txt = live_cs.getPropertyValue('background-position');
+        if (bg_position_txt) {
+            clone_el.style.setProperty('background-position', bg_position_txt, 'important');
+        }
+        var bg_repeat_txt = live_cs.getPropertyValue('background-repeat');
+        if (bg_repeat_txt) {
+            clone_el.style.setProperty('background-repeat', bg_repeat_txt, 'important');
+        }
+    }
+
+    /**
+     * True when the element's visible fill includes a url() image layer (not gradient-only).
+     */
+    function has_capture_url_background_image_boo(live_cs) {
+        var bg_image_txt = (live_cs.getPropertyValue('background-image') || '').trim();
+        return bg_image_txt !== 'none' && bg_image_txt.indexOf('url(') !== -1 && bg_image_txt.indexOf('gradient') === -1;
+    }
+
+    var SCREENSHOT_CLONE_PAINT_PROPS_ARR = [
+        'color',
+        'backgroundColor',
+        'backgroundImage',
+        'backgroundSize',
+        'backgroundPosition',
+        'backgroundRepeat',
+        'borderTopColor',
+        'borderRightColor',
+        'borderBottomColor',
+        'borderLeftColor',
+        'borderTopWidth',
+        'borderRightWidth',
+        'borderBottomWidth',
+        'borderLeftWidth',
+        'borderTopStyle',
+        'borderRightStyle',
+        'borderBottomStyle',
+        'borderLeftStyle',
+        'borderRadius',
+        'textShadow',
+        'opacity'
+    ];
+
+    /**
+     * Solid fill behind element captures: white matte makes cyan text in gaps look invisible;
+     * prefer an ancestor background-color (hero/section) or dark default.
+     */
+    function pick_solid_matte_color_for_element(iframe_win, target_el) {
+        var el = target_el;
+        var depth_num = 0;
+        var default_matte_txt = '#0f172a';
+        while (el && depth_num < 12) {
+            try {
+                var cs = iframe_win.getComputedStyle(el);
+                var bg_txt = cs.getPropertyValue('background-color');
+                if (!is_css_background_color_transparent_boo(bg_txt)) {
+                    var lum_num = rgb_string_luminance_num(bg_txt);
+                    if (lum_num >= 0 && lum_num <= 0.94) {
+                        return bg_txt.trim();
+                    }
+                }
+            } catch (e_matte) {}
+            el = el.parentElement;
+            depth_num++;
+        }
+        return default_matte_txt;
+    }
+
+    function rgb_string_luminance_num(color_txt) {
+        var s = (color_txt || '').trim();
+        var m = s.match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*(?:,\s*([\d.]+)\s*)?\)/i);
+        if (m) {
+            var a_num = m[4] !== undefined ? parseFloat(m[4]) : 1;
+            if (a_num < 0.05) {
+                return -1;
+            }
+            var r_num = parseInt(m[1], 10);
+            var g_num = parseInt(m[2], 10);
+            var b_num = parseInt(m[3], 10);
+            return (0.299 * r_num + 0.587 * g_num + 0.114 * b_num) / 255;
+        }
+        var hx = s.match(/^#([0-9a-f]{3}|[0-9a-f]{6})$/i);
+        if (hx) {
+            var h = hx[1];
+            var r2;
+            var g2;
+            var b2;
+            if (h.length === 3) {
+                r2 = parseInt(h.charAt(0) + h.charAt(0), 16);
+                g2 = parseInt(h.charAt(1) + h.charAt(1), 16);
+                b2 = parseInt(h.charAt(2) + h.charAt(2), 16);
+            } else {
+                r2 = parseInt(h.slice(0, 2), 16);
+                g2 = parseInt(h.slice(2, 4), 16);
+                b2 = parseInt(h.slice(4, 6), 16);
+            }
+            return (0.299 * r2 + 0.587 * g2 + 0.114 * b2) / 255;
+        }
+        return -1;
+    }
+
+    /**
+     * Pick a solid replacement for gradient clipped text. Screenshots are composited on a white
+     * matte — choosing the brightest stop (often white) makes glyphs invisible; prefer a mid stop.
+     */
+    function pick_fill_color_for_clipped_gradient_txt(cs, bg_img_txt) {
+        var stops_arr = [];
+        var re = /rgba?\([^)]+\)/gi;
+        var mm;
+        while ((mm = re.exec(bg_img_txt)) !== null) {
+            stops_arr.push(mm[0]);
+        }
+        var s_num;
+        for (s_num = 0; s_num < stops_arr.length; s_num++) {
+            var lum_mid_num = rgb_string_luminance_num(stops_arr[s_num]);
+            if (lum_mid_num >= 0.12 && lum_mid_num <= 0.88) {
+                return stops_arr[s_num];
+            }
+        }
+        for (s_num = 0; s_num < stops_arr.length; s_num++) {
+            var lum_skip_white_num = rgb_string_luminance_num(stops_arr[s_num]);
+            if (lum_skip_white_num >= 0 && lum_skip_white_num < 0.93) {
+                return stops_arr[s_num];
+            }
+        }
+        for (s_num = stops_arr.length - 1; s_num >= 0; s_num--) {
+            var lum_purple_num = rgb_string_luminance_num(stops_arr[s_num]);
+            if (lum_purple_num >= 0 && lum_purple_num < 0.98) {
+                return stops_arr[s_num];
+            }
+        }
+        if (stops_arr.length) {
+            return stops_arr[0];
+        }
+        var grad_from_txt = cs.getPropertyValue('--gradient-from').trim();
+        var grad_to_txt = cs.getPropertyValue('--gradient-to').trim();
+        if (grad_from_txt) {
+            return grad_from_txt;
+        }
+        if (grad_to_txt) {
+            return grad_to_txt;
+        }
+        return '#64748b';
+    }
+
+    /**
+     * dom-to-image-more passes a detached clone root to onclone; ownerDocument still points at
+     * the live preview document — never use ownerDocument as the clone tree.
+     */
+    function getScreenshotCloneHeadEl(cloned_root_el) {
+        if (!cloned_root_el) {
+            return null;
+        }
+        if (cloned_root_el.tagName && cloned_root_el.tagName.toLowerCase() === 'head') {
+            return cloned_root_el;
+        }
+        if (cloned_root_el.querySelector) {
+            var head_el = cloned_root_el.querySelector('head');
+            if (head_el) {
+                return head_el;
+            }
+        }
+        if (cloned_root_el.getElementsByTagName) {
+            var heads_arr = cloned_root_el.getElementsByTagName('head');
+            if (heads_arr && heads_arr.length) {
+                return heads_arr[0];
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Append a <style> block to the detached capture clone only (never the live preview).
+     */
+    function appendStyleTextToCloneHeadFun(live_doc, cloned_root_el, attr_txt, css_txt) {
+        var clone_head_el = getScreenshotCloneHeadEl(cloned_root_el);
+        if (!live_doc || !clone_head_el || !css_txt) {
+            return null;
+        }
+        var style_el = live_doc.createElement('style');
+        if (attr_txt) {
+            style_el.setAttribute(attr_txt, 'true');
+        }
+        style_el.textContent = css_txt;
+        clone_head_el.appendChild(style_el);
+        return style_el;
+    }
+
+    /**
+     * Per-node capture fixes: dom-to-image-more pairs live + clone nodes in adjustClonedNode.
+     * Reads computed styles from the live preview; writes inline styles on the clone only.
+     */
+    function applyScreenshotNodeFixOnClonePairFun(live_el, clone_el, live_win) {
+        if (!live_el || !clone_el || live_el.nodeType !== 1 || !live_win) {
+            return;
+        }
+        try {
+            var live_cs = live_win.getComputedStyle(live_el);
+            var pi_num;
+            for (pi_num = 0; pi_num < SCREENSHOT_CLONE_PAINT_PROPS_ARR.length; pi_num++) {
+                var css_prop_txt = SCREENSHOT_CLONE_PAINT_PROPS_ARR[pi_num];
+                var val_txt = live_cs.getPropertyValue(css_prop_txt);
+                if (!val_txt || val_txt === 'none' || val_txt === 'normal') {
+                    continue;
+                }
+                if (css_prop_txt === 'backgroundColor' && is_css_background_color_transparent_boo(val_txt)) {
+                    continue;
+                }
+                if (css_prop_txt === 'backgroundColor' && is_semi_transparent_background_color_boo(val_txt)) {
+                    continue;
+                }
+                if (css_prop_txt === 'opacity' && val_txt === '1') {
+                    continue;
+                }
+                clone_el.style.setProperty(css_prop_txt, val_txt);
+            }
+
+            var bg_txt = live_cs.backgroundColor;
+            var box_shadow_txt = live_cs.boxShadow;
+            var has_shadow_boo = !!(box_shadow_txt && box_shadow_txt !== 'none');
+            var has_backdrop_boo = has_backdrop_filter_boo(live_cs);
+            var has_gradient_fill_boo = has_capture_gradient_background_boo(live_cs);
+            var has_semi_transparent_fill_boo = is_semi_transparent_background_color_boo(bg_txt);
+            var matte_txt = pick_screenshot_matte_for_element_fun(live_win, live_el, live_cs);
+
+            if (has_gradient_fill_boo) {
+                sync_capture_gradient_background_to_clone_fun(live_win, live_cs, clone_el);
+            } else if (has_capture_url_background_image_boo(live_cs)) {
+                sync_capture_url_background_to_clone_fun(live_cs, clone_el);
+            }
+
+            if (has_backdrop_boo) {
+                clone_el.style.setProperty('backdrop-filter', 'none', 'important');
+                clone_el.style.setProperty('-webkit-backdrop-filter', 'none', 'important');
+            }
+            if (has_semi_transparent_fill_boo && !has_gradient_fill_boo) {
+                var capture_bg_txt = resolve_semi_transparent_background_for_capture_txt(bg_txt, matte_txt, live_win);
+                if (capture_bg_txt && !is_css_background_color_transparent_boo(capture_bg_txt)) {
+                    clone_el.style.setProperty('background-color', capture_bg_txt, 'important');
+                }
+            } else if (has_backdrop_boo && is_css_background_color_transparent_boo(bg_txt) && !has_gradient_fill_boo) {
+                var frosted_bg_txt = resolve_backdrop_glass_background_for_capture_txt(matte_txt);
+                if (frosted_bg_txt && !is_css_background_color_transparent_boo(frosted_bg_txt)) {
+                    clone_el.style.setProperty('background-color', frosted_bg_txt, 'important');
+                }
+            }
+            if (has_shadow_boo) {
+                clone_el.style.setProperty('box-shadow', box_shadow_txt, 'important');
+                clone_el.style.setProperty('-webkit-box-shadow', box_shadow_txt, 'important');
+                if ((live_cs.overflow || '').trim() === 'hidden') {
+                    clone_el.style.overflow = 'visible';
+                }
+            }
+
+            var clip_txt = (live_cs.getPropertyValue('background-clip') || '').trim();
+            var wk_clip_txt = (live_cs.getPropertyValue('-webkit-background-clip') || '').trim();
+            if (clip_txt === 'text' || wk_clip_txt === 'text') {
+                var bg_img_txt = live_cs.getPropertyValue('background-image') || '';
+                if (bg_img_txt && bg_img_txt !== 'none' && bg_img_txt.indexOf('gradient') !== -1) {
+                    var fill_col_txt = pick_fill_color_for_clipped_gradient_txt(live_cs, bg_img_txt);
+                    var lum_num = rgb_string_luminance_num(fill_col_txt);
+                    if (lum_num < 0 || lum_num < 0.22) {
+                        fill_col_txt = '#e2e8f0';
+                    } else if (lum_num > 0.93) {
+                        fill_col_txt = '#0891b2';
+                    }
+                    clone_el.style.setProperty('background-image', 'none', 'important');
+                    clone_el.style.setProperty('background', 'none', 'important');
+                    clone_el.style.setProperty('background-clip', 'unset', 'important');
+                    clone_el.style.setProperty('-webkit-background-clip', 'unset', 'important');
+                    clone_el.style.setProperty('-webkit-text-fill-color', 'unset', 'important');
+                    clone_el.style.setProperty('color', fill_col_txt, 'important');
+                    clone_el.style.setProperty('opacity', '1', 'important');
+                    clone_el.style.setProperty('visibility', 'visible', 'important');
+                }
+            }
+
+            if (live_el.tagName && live_el.tagName.toLowerCase() === 'img') {
+                var rect_obj = live_el.getBoundingClientRect();
+                var rect_w_num = Math.round(rect_obj.width);
+                var rect_h_num = Math.round(rect_obj.height);
+                if (rect_w_num >= 1 && rect_h_num >= 1) {
+                    clone_el.removeAttribute('width');
+                    clone_el.removeAttribute('height');
+                    clone_el.style.width = rect_w_num + 'px';
+                    clone_el.style.height = rect_h_num + 'px';
+                    var object_fit_txt = live_cs.objectFit || live_cs.getPropertyValue('object-fit');
+                    if (object_fit_txt && object_fit_txt !== 'fill') {
+                        clone_el.style.objectFit = object_fit_txt;
+                    }
+                    var object_position_txt = live_cs.objectPosition || live_cs.getPropertyValue('object-position');
+                    if (object_position_txt) {
+                        clone_el.style.objectPosition = object_position_txt;
+                    }
+                }
+            }
+        } catch (e_node) {}
+    }
+
+    /**
+     * Inject capture-only styles into the detached clone <head> (fonts, anim freeze, root vars).
+     */
+    function runScreenshotCloneHeadFixesFun(live_doc, cloned_root_el, prep_cache_obj, include_ve_outline_hide_boo) {
+        prep_cache_obj = prep_cache_obj || {};
+        appendStyleTextToCloneHeadFun(live_doc, cloned_root_el, 'data-screenshot-anim', SCREENSHOT_ANIM_FREEZE_CSS_TXT);
+        if (prep_cache_obj.font_faces_css_txt) {
+            appendStyleTextToCloneHeadFun(live_doc, cloned_root_el, 'data-screenshot-fonts', prep_cache_obj.font_faces_css_txt);
+        }
+        if (prep_cache_obj.fa_fallback_css_txt) {
+            appendStyleTextToCloneHeadFun(live_doc, cloned_root_el, 'data-screenshot-fa-fallback', prep_cache_obj.fa_fallback_css_txt);
+        }
+        injectResolvedRootCssVariablesToClone(live_doc, cloned_root_el);
+        if (include_ve_outline_hide_boo) {
+            appendHideVisualEditOutlineStyleToClone(live_doc, cloned_root_el);
+        }
+    }
+
+    /**
+     * Copy resolved :root custom properties from the live preview into the capture clone
+     * so var(--token) references in cloned stylesheets still resolve.
+     */
+    function injectResolvedRootCssVariablesToClone(live_doc, cloned_root_el) {
+        var live_win = live_doc && live_doc.defaultView;
+        var clone_head_el = getScreenshotCloneHeadEl(cloned_root_el);
+        if (!live_win || !clone_head_el) {
+            return;
+        }
+        try {
+            var root_cs = live_win.getComputedStyle(live_doc.documentElement);
+            var css_chunks_arr = [];
+            for (var ri_num = 0; ri_num < root_cs.length; ri_num++) {
+                var prop_txt = root_cs[ri_num];
+                if (prop_txt.indexOf('--') !== 0) {
+                    continue;
+                }
+                var val_txt = root_cs.getPropertyValue(prop_txt).trim();
+                if (!val_txt) {
+                    continue;
+                }
+                css_chunks_arr.push(prop_txt + ':' + val_txt);
+            }
+            if (css_chunks_arr.length) {
+                var style_el = live_doc.createElement('style');
+                style_el.setAttribute('data-screenshot-root-vars', 'true');
+                style_el.textContent = ':root{' + css_chunks_arr.join(';') + '}';
+                clone_head_el.appendChild(style_el);
+            }
+        } catch (e_root) {}
+    }
+
+    /**
+     * Same as appendHideVisualEditOutlineStyle but scoped to the detached capture clone tree.
+     */
+    function appendHideVisualEditOutlineStyleToClone(live_doc, cloned_root_el) {
+        var clone_head_el = getScreenshotCloneHeadEl(cloned_root_el);
+        if (!live_doc || !clone_head_el) {
+            return null;
+        }
+        var css_txt =
+            '[data-full-xpath],[data-full-xpath]:hover,[data-full-xpath]:focus,' +
+            '[data-full-xpath].visual-edit-selected{' +
+            'outline:none!important;outline-offset:0!important;box-shadow:none!important;' +
+            '}' +
+            '#visual-edit-indicator{display:none!important;}';
+        var st_el = live_doc.createElement('style');
+        st_el.setAttribute('data-screenshot-hide-ve-outline', 'true');
+        st_el.textContent = css_txt;
+        clone_head_el.appendChild(st_el);
+        return st_el;
+    }
+
+    /**
+     * Resolve webfonts/ folder from the same Font Awesome CSS the page already loads
+     * (e.g. .../6.5.1/css/all.min.css → .../6.5.1/webfonts/). Fallback: cdnjs 6.5.1.
+     */
+    function getFontAwesomeWebfontsBaseUrl(iframe_doc) {
+        var default_base_txt = 'https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/webfonts/';
+        var links = iframe_doc.querySelectorAll('link[rel="stylesheet"]');
+        for (var i = 0; i < links.length; i++) {
+            var href_attr_txt = links[i].getAttribute('href') || '';
+            if (href_attr_txt.indexOf('font-awesome') === -1 && href_attr_txt.indexOf('fontawesome') === -1) {
+                continue;
+            }
+            var abs_txt = '';
+            try {
+                abs_txt = new URL(href_attr_txt, iframe_doc.location.href).href;
+            } catch (e0) {
+                continue;
+            }
+            var ver_m = abs_txt.match(/font-awesome\/(\d+\.\d+\.\d+)\//i);
+            if (ver_m && ver_m[1]) {
+                return 'https://cdnjs.cloudflare.com/ajax/libs/font-awesome/' + ver_m[1] + '/webfonts/';
+            }
+            var css_dir_m = abs_txt.match(/^(.*\/)css\/[^/]+$/i);
+            if (css_dir_m && css_dir_m[1]) {
+                return css_dir_m[1] + 'webfonts/';
+            }
+        }
+        return default_base_txt;
+    }
+
+    /**
+     * foreignObject capture often drops FA webfonts (pseudo-element tofu).
+     * Inject known-good FA6 woff2 as data: @font-face plus class→family hints.
+     */
+    function buildFontAwesomeFallbackCssTxtFun(iframe_doc, iframe_win) {
+        var has_icons_boo = !!iframe_doc.querySelector(
+            '.fa, .fas, .far, .fab, .fal, .fad, .fass, .fa-solid, .fa-regular, .fa-brands'
+        );
+        if (!has_icons_boo) {
+            return Promise.resolve(null);
+        }
+
+        var woff_base_txt = getFontAwesomeWebfontsBaseUrl(iframe_doc);
+        if (woff_base_txt.charAt(woff_base_txt.length - 1) !== '/') {
+            woff_base_txt += '/';
+        }
+        var solid_url_txt = woff_base_txt + 'fa-solid-900.woff2';
+        var regular_url_txt = woff_base_txt + 'fa-regular-400.woff2';
+        var brands_url_txt = woff_base_txt + 'fa-brands-400.woff2';
+
+        function face_css_txt(family_txt, weight_txt, data_uri_txt) {
+            if (!data_uri_txt) return '';
+            return '@font-face{font-family:' + JSON.stringify(family_txt) + ';font-style:normal;font-weight:' + weight_txt + ';font-display:block;src:url(' + JSON.stringify(data_uri_txt) + ') format("woff2");}\n';
+        }
+
+        var shot_solid_family_txt = 'FontAwesomeScreenshotSolid';
+        var shot_regular_family_txt = 'FontAwesomeScreenshotRegular';
+        var shot_brands_family_txt = 'FontAwesomeScreenshotBrands';
+
+        return Promise.all([
+            fetchAsDataUriWithParentFallback(iframe_win, solid_url_txt),
+            fetchAsDataUriWithParentFallback(iframe_win, regular_url_txt),
+            fetchAsDataUriWithParentFallback(iframe_win, brands_url_txt)
+        ]).then(function(data_uris_arr) {
+            var solid_data_txt = data_uris_arr[0];
+            var regular_data_txt = data_uris_arr[1];
+            var brands_data_txt = data_uris_arr[2];
+            if (!solid_data_txt && !regular_data_txt && !brands_data_txt) {
+                return null;
+            }
+
+            var css_txt = '';
+            if (solid_data_txt) {
+                css_txt += face_css_txt(shot_solid_family_txt, '900', solid_data_txt);
+            }
+            if (regular_data_txt) {
+                css_txt += face_css_txt(shot_regular_family_txt, '400', regular_data_txt);
+            }
+            if (brands_data_txt) {
+                css_txt += face_css_txt(shot_brands_family_txt, '400', brands_data_txt);
+            }
+
+            var solid_fam_q_txt = JSON.stringify(shot_solid_family_txt);
+            var reg_fam_q_txt = JSON.stringify(shot_regular_family_txt);
+            var brand_fam_q_txt = JSON.stringify(shot_brands_family_txt);
+
+            css_txt +=
+                ':root .fa,:root .fas,:root .fass,:root .fa-solid{--fa-style-family:' + solid_fam_q_txt + ',sans-serif !important;--fa-font-solid:normal 900 1em/1 ' + solid_fam_q_txt + ',sans-serif !important;}' +
+                ':root .far,:root .fal,:root .fa-regular{--fa-style-family:' + reg_fam_q_txt + ',sans-serif !important;}' +
+                ':root .fab,:root .fa-brands{--fa-style-family:' + brand_fam_q_txt + ',sans-serif !important;}' +
+                '.fa,.fas,.fass,.fa-solid{font-family:' + solid_fam_q_txt + ',sans-serif !important;font-weight:900 !important;-webkit-font-smoothing:antialiased;}' +
+                '.far,.fal,.fa-regular{font-family:' + reg_fam_q_txt + ',sans-serif !important;font-weight:400 !important;-webkit-font-smoothing:antialiased;}' +
+                '.fab,.fa-brands{font-family:' + brand_fam_q_txt + ',sans-serif !important;font-weight:400 !important;-webkit-font-smoothing:antialiased;}' +
+                '.fad{font-family:' + reg_fam_q_txt + ',sans-serif !important;font-weight:400 !important;-webkit-font-smoothing:antialiased;}' +
+                '.fa::before,.fas::before,.fass::before,.fa-solid::before{font-family:' + solid_fam_q_txt + ',sans-serif !important;font-weight:900 !important;-webkit-font-smoothing:antialiased;}' +
+                '.far::before,.fal::before,.fa-regular::before{font-family:' + reg_fam_q_txt + ',sans-serif !important;font-weight:400 !important;-webkit-font-smoothing:antialiased;}' +
+                '.fab::before,.fa-brands::before{font-family:' + brand_fam_q_txt + ',sans-serif !important;font-weight:400 !important;-webkit-font-smoothing:antialiased;}' +
+                '.fad::before{font-family:' + reg_fam_q_txt + ',sans-serif !important;font-weight:400 !important;-webkit-font-smoothing:antialiased;}' +
+                '.fa::after,.fas::after,.fass::after,.fa-solid::after{font-family:' + solid_fam_q_txt + ',sans-serif !important;font-weight:900 !important;}' +
+                '.far::after,.fal::after,.fa-regular::after{font-family:' + reg_fam_q_txt + ',sans-serif !important;font-weight:400 !important;}' +
+                '.fab::after,.fa-brands::after{font-family:' + brand_fam_q_txt + ',sans-serif !important;font-weight:400 !important;}';
+
+            return css_txt;
+        });
+    }
+
+    /** @deprecated Live DOM injection removed — use buildFontAwesomeFallbackCssTxtFun. */
+    function injectFontAwesomeFallbackDataFaces(iframe_doc, iframe_win) {
+        return buildFontAwesomeFallbackCssTxtFun(iframe_doc, iframe_win);
+    }
+
+    /**
+     * Detect Tailwind / Lucide / Font Awesome / daisyUI / Alpine usage from preview HTML.
+     */
+    function scanPreviewStyleLibrariesObj(iframe_doc) {
+        if (!iframe_doc || !iframe_doc.documentElement) {
+            return {};
+        }
+
+        var html_txt = iframe_doc.documentElement.outerHTML || '';
+        var libraries_obj = {
+            tailwind_boo: html_txt.indexOf('@tailwindcss/browser') !== -1,
+            lucide_boo: /\bdata-lucide\b|\/lucide@/i.test(html_txt),
+            fontawesome_boo: /font-awesome|fontawesome/i.test(html_txt),
+            daisyui_boo: /daisyui@/i.test(html_txt),
+            alpine_boo: /alpinejs@/i.test(html_txt)
+        };
+
+        var tailwind_match_arr = html_txt.match(/@tailwindcss\/browser@([\d.]+)/i);
+        if (tailwind_match_arr && tailwind_match_arr[1]) {
+            libraries_obj.tailwind_version_txt = tailwind_match_arr[1];
+        }
+        var lucide_match_arr = html_txt.match(/\/lucide@([\d.]+)/i);
+        if (lucide_match_arr && lucide_match_arr[1]) {
+            libraries_obj.lucide_version_txt = lucide_match_arr[1];
+        }
+        var fa_match_arr = html_txt.match(/font-awesome\/([\d.]+)\//i);
+        if (fa_match_arr && fa_match_arr[1]) {
+            libraries_obj.fontawesome_version_txt = fa_match_arr[1];
+        }
+        var daisyui_match_arr = html_txt.match(/daisyui@([\d.]+)/i);
+        if (daisyui_match_arr && daisyui_match_arr[1]) {
+            libraries_obj.daisyui_version_txt = daisyui_match_arr[1];
+        }
+        var alpine_match_arr = html_txt.match(/alpinejs@([\d.]+)/i);
+        if (alpine_match_arr && alpine_match_arr[1]) {
+            libraries_obj.alpine_version_txt = alpine_match_arr[1];
+        }
+        if (typeof APP_CONFIG !== 'undefined' && APP_CONFIG.appBuilderCurrentVersionTxt) {
+            libraries_obj.app_builder_version_txt = String(APP_CONFIG.appBuilderCurrentVersionTxt);
+        }
+
+        return libraries_obj;
+    }
+
+    /**
+     * Wait for Tailwind, Lucide, Font Awesome, and fonts inside the preview iframe before capture.
+     */
+    function waitForPreviewStyleLibrariesReadyInIframe(iframe_doc, iframe_win) {
+        var libraries_obj = scanPreviewStyleLibrariesObj(iframe_doc);
+
+        function wait_for_document_fonts_fun() {
+            if (!iframe_doc.fonts || typeof iframe_doc.fonts.ready === 'undefined') {
+                return Promise.resolve();
+            }
+            return iframe_doc.fonts.ready.catch(function() {
+                return undefined;
+            });
+        }
+
+        function wait_for_tailwind_browser_fun() {
+            if (!libraries_obj.tailwind_boo) {
+                return Promise.resolve();
+            }
+            return new Promise(function(resolve) {
+                var frame_count_num = 0;
+                function next_frame_fun() {
+                    frame_count_num++;
+                    if (frame_count_num >= 4) {
+                        iframe_win.setTimeout(resolve, 2200);
+                        return;
+                    }
+                    iframe_win.requestAnimationFrame(next_frame_fun);
+                }
+                iframe_win.requestAnimationFrame(next_frame_fun);
+            });
+        }
+
+        function wait_for_lucide_icons_fun() {
+            if (!libraries_obj.lucide_boo) {
+                return Promise.resolve();
+            }
+            return new Promise(function(resolve) {
+                var attempts_num = 0;
+                var max_attempts_num = 70;
+                var pending_selector_txt = 'i[data-lucide], [data-lucide]:not(svg):not([data-lucide-invalid])';
+
+                function check_pending_icons_fun() {
+                    if (!iframe_doc.querySelector(pending_selector_txt) || attempts_num >= max_attempts_num) {
+                        resolve();
+                        return;
+                    }
+                    attempts_num++;
+                    iframe_win.setTimeout(check_pending_icons_fun, 100);
+                }
+
+                if (iframe_win.lucide && typeof iframe_win.lucide.createIcons === 'function') {
+                    try {
+                        iframe_win.lucide.createIcons();
+                    } catch (e) {}
+                }
+
+                iframe_win.setTimeout(check_pending_icons_fun, 250);
+            });
+        }
+
+        function wait_for_alpine_fun() {
+            if (!libraries_obj.alpine_boo) {
+                return Promise.resolve();
+            }
+            return new Promise(function(resolve) {
+                if (iframe_win.Alpine && typeof iframe_win.Alpine.start === 'function') {
+                    iframe_win.setTimeout(resolve, 600);
+                    return;
+                }
+                iframe_win.setTimeout(resolve, 1200);
+            });
+        }
+
+        function wait_for_fontawesome_paint_fun() {
+            if (!libraries_obj.fontawesome_boo) {
+                return Promise.resolve();
+            }
+            return new Promise(function(resolve) {
+                iframe_win.setTimeout(resolve, 400);
+            });
+        }
+
+        return Promise.all([
+            wait_for_document_fonts_fun(),
+            wait_for_tailwind_browser_fun(),
+            wait_for_lucide_icons_fun(),
+            wait_for_alpine_fun(),
+            wait_for_fontawesome_paint_fun()
+        ]).then(function() {
+            return new Promise(function(resolve) {
+                iframe_win.setTimeout(resolve, 350);
+            });
+        });
+    }
+
+    /**
+     * Remove temporary screenshot prep injected into the live preview iframe.
+     */
+    function releaseIframeCapturePrepFun(cleanup_obj, extra_opts_obj) {
+        extra_opts_obj = extra_opts_obj || {};
+        if (cleanup_obj) {
+            if (cleanup_obj.fontStyle && cleanup_obj.fontStyle.parentNode) {
+                cleanup_obj.fontStyle.parentNode.removeChild(cleanup_obj.fontStyle);
+            }
+            if (cleanup_obj.animStyle && cleanup_obj.animStyle.parentNode) {
+                cleanup_obj.animStyle.parentNode.removeChild(cleanup_obj.animStyle);
+            }
+            if (cleanup_obj.faFallbackStyle && cleanup_obj.faFallbackStyle.parentNode) {
+                cleanup_obj.faFallbackStyle.parentNode.removeChild(cleanup_obj.faFallbackStyle);
+            }
+        }
+        var hide_ve_outline_style_el = extra_opts_obj.hide_ve_outline_style_el;
+        if (hide_ve_outline_style_el && hide_ve_outline_style_el.parentNode) {
+            hide_ve_outline_style_el.parentNode.removeChild(hide_ve_outline_style_el);
+        }
+    }
+
+    /**
+     * Wait for preview assets to load and build capture-only CSS in memory.
+     * Does not modify the live preview DOM, except for the temporary image/video
+     * pre-inlining that is reverted right after dom-to-image finishes cloning.
+     */
+    function prepareIframeForCapture(iframe_doc, iframe_win) {
+        var LOAD_TIMEOUT_NUM = 5000;
+
+        var images_arr = Array.prototype.slice.call(iframe_doc.querySelectorAll('img'));
+        var load_promises_arr = [];
+        images_arr.forEach(function(img) {
+            if (img.complete) {
+                return;
+            }
+            load_promises_arr.push(new Promise(function(resolve) {
+                img.onload = resolve;
+                img.onerror = resolve;
+            }));
+        });
+
+        var wait_promise = load_promises_arr.length
+            ? Promise.race([
+                Promise.all(load_promises_arr),
+                new Promise(function(resolve) { setTimeout(resolve, LOAD_TIMEOUT_NUM); })
+            ])
+            : Promise.resolve();
+
+        return wait_promise.then(function() {
+            var load_desc_arr = [
+                '900 16px "Font Awesome 6 Free"',
+                '400 16px "Font Awesome 6 Free"',
+                '400 16px "Font Awesome 6 Brands"',
+                '900 16px "Font Awesome 5 Free"',
+                '400 16px "Font Awesome 5 Free"',
+                '400 16px "Font Awesome 5 Brands"',
+                '900 16px FontAwesomeScreenshotSolid',
+                '400 16px FontAwesomeScreenshotRegular',
+                '400 16px FontAwesomeScreenshotBrands'
+            ];
+            var fl_arr = [];
+            if (iframe_doc.fonts && iframe_doc.fonts.load) {
+                load_desc_arr.forEach(function(desc_txt) {
+                    fl_arr.push(iframe_doc.fonts.load(desc_txt).catch(function() {}));
+                });
+            }
+            return fl_arr.length ? Promise.all(fl_arr) : Promise.resolve();
+        }).then(function() {
+            if (iframe_doc.fonts && iframe_doc.fonts.ready) {
+                return Promise.race([
+                    iframe_doc.fonts.ready,
+                    new Promise(function(resolve) { setTimeout(resolve, 3000); })
+                ]);
+            }
+        }).then(function() {
+            return waitForPreviewStyleLibrariesReadyInIframe(iframe_doc, iframe_win);
+        }).then(function() {
+            return preinlineDocumentImagesForCaptureFun(iframe_doc, iframe_win);
+        }).then(function() {
+            return preinlineDocumentBackgroundImagesForCaptureFun(iframe_doc, iframe_win);
+        }).then(function() {
+            // Runs after the <img> pass so the stand-ins it creates are never
+            // double-processed by the CORS/proxy inlining above.
+            return preinlineDocumentVideosForCaptureFun(iframe_doc, iframe_win);
+        }).then(function() {
+            return inlineFontFaces(iframe_doc, iframe_win).then(function(font_faces_css_txt) {
+                return buildFontAwesomeFallbackCssTxtFun(iframe_doc, iframe_win).then(function(fa_fallback_css_txt) {
+                    return {
+                        font_faces_css_txt: font_faces_css_txt || '',
+                        fa_fallback_css_txt: fa_fallback_css_txt || ''
+                    };
+                });
+            });
+        });
+    }
+
+    var capture_busy_boo = false;
+    var capture_aborted_boo = false;
+    var full_page_blob_promise_obj = null;
+
+    /**
+     * Abort an in-flight screenshot capture (e.g. user closed the modal early).
+     */
+    function abortCapture() {
+        capture_aborted_boo = true;
+        capture_busy_boo = false;
+    }
+
+    /**
+     * Internal capture core: prepares the iframe, runs dom-to-image-more, and returns the
+     * resulting <canvas>. Supports two modes:
+     *   - 'full': capture the whole scrollable document
+     *   - 'viewport': capture only what the user currently sees in the iframe
+     *
+     * For viewport mode we always capture the FULL document with dom-to-image-more
+     * and then crop client-side to the user's current scroll position. Letting
+     * the engine render a smaller portion breaks layout for sites that use
+     * 100vh / position:sticky / position:fixed.
+     *
+     * output_scale_num (optional, 'full' mode only — advisor design reference) renders a larger
+     * canvas than the preview layout; it is lowered to fit the browser canvas limits.
+     *
+     * Returns a Promise<HTMLCanvasElement|null>.
+     */
+    function captureIframeElementCanvas(iframe_el, mode_txt, output_scale_num) {
+        if (!iframe_el) {
+            return Promise.resolve(null);
+        }
+
+        var iframe_accessible_boo = false;
+        try {
+            iframe_accessible_boo = !!(iframe_el.contentDocument && iframe_el.contentDocument.body);
+        } catch (e) {}
+
+        if (!iframe_accessible_boo) {
+            return Promise.resolve(null);
+        }
+
+        var iframe_win = iframe_el.contentWindow;
+        var iframe_doc = iframe_el.contentDocument;
+
+        resetScreenshotCaptureCacheFun();
+        return prepareIframeForCapture(iframe_doc, iframe_win).then(function(prep_cache_obj) {
+            var metrics_obj = getPreviewCaptureMetricsFun(iframe_el, iframe_doc, iframe_win);
+            var is_viewport_mode_boo = (mode_txt === 'viewport');
+
+            var options_obj = buildDomToImageCaptureOptionsFun(
+                iframe_doc,
+                iframe_win,
+                metrics_obj,
+                prep_cache_obj,
+                false,
+                is_viewport_mode_boo
+            );
+            var canvas_scale_num = is_viewport_mode_boo ? 1 : pickScreenshotOutputScaleNumFun(metrics_obj, output_scale_num);
+
+            return captureDocumentElementToCanvasFun(iframe_doc, iframe_win, options_obj, canvas_scale_num).then(function(full_canvas) {
+                if (!full_canvas || !is_viewport_mode_boo) {
+                    return full_canvas;
+                }
+
+                return crop_canvas_from_document_rect_fun(
+                    full_canvas,
+                    metrics_obj,
+                    metrics_obj.scroll_x_num,
+                    metrics_obj.scroll_y_num,
+                    metrics_obj.viewport_w_num,
+                    metrics_obj.viewport_h_num,
+                    metrics_obj.viewport_w_num,
+                    metrics_obj.viewport_h_num,
+                    iframe_doc
+                );
+            });
+        }).catch(function(err_obj) {
+            // prepareIframeForCapture can reject before dom-to-image runs, in which case
+            // the video stand-ins would otherwise stay in the live preview forever.
+            restoreCapturedVideosFun(iframe_doc);
+            restoreInlinedImagesFun(iframe_doc);
+            throw err_obj;
+        });
+    }
+
+    function captureIframeCanvas(mode_txt, output_scale_num) {
+        var $iframe = $('.preview-frame');
+        var iframe_el = $iframe[0];
+
+        if (!iframe_el) {
+            return Promise.resolve(null);
+        }
+
+        return captureIframeElementCanvas(iframe_el, mode_txt, output_scale_num);
+    }
+
+    /**
+     * Shared post-capture handler: annotation modal or direct chat attachment.
+     */
+    function deliverScreenshotBlob(editor, blob_obj, file_name_txt, skip_open_annotation_boo) {
+        if (capture_aborted_boo) {
+            return;
+        }
+        if (!blob_obj) {
+            if (skip_open_annotation_boo && window.AppBuilderAnnotation && typeof window.AppBuilderAnnotation.failPendingCapture === 'function') {
+                window.AppBuilderAnnotation.failPendingCapture();
+            }
+            Swal.fire({ title: translations.aiAppBuilder.screenshotCaptureFailed, icon: 'error' });
+            return;
+        }
+
+        if (skip_open_annotation_boo && window.AppBuilderAnnotation && typeof window.AppBuilderAnnotation.completePendingCapture === 'function') {
+            window.AppBuilderAnnotation.completePendingCapture({
+                blob_obj: blob_obj,
+                file_name_txt: file_name_txt
+            });
+            return;
+        }
+
+        if (window.AppBuilderAnnotation && typeof window.AppBuilderAnnotation.openForBlob === 'function') {
+            window.AppBuilderAnnotation.openForBlob({
+                blob_obj: blob_obj,
+                file_name_txt: file_name_txt,
+                on_save_fun: function(annotated_blob_obj, add_to_chat_after_upload_boo) {
+                    attachScreenshotBlob(editor, annotated_blob_obj, file_name_txt, !!add_to_chat_after_upload_boo);
+                }
+            });
+            return;
+        }
+
+        attachScreenshotBlob(editor, blob_obj, file_name_txt, false);
+    }
+
+    /**
+     * Capture a screenshot of the preview iframe and attach it to the chat.
+     * Uses dom-to-image-more inside the live preview iframe.
+     *
+     * Pipeline:
+     *   1) dom-to-image-more → canvas → blob
+     *   2) AppBuilderAnnotation.openForBlob() lets the user mark up the image
+     *   3) Only the (possibly annotated) result is uploaded to S3
+     *
+     * @param {object} editor       AppBuilderEditor / AIAppBuilder instance
+     * @param {object} options_obj  { mode_txt: 'viewport' | 'full' }
+     */
+    function captureIframeScreenshot(editor, options_obj) {
+        if (capture_busy_boo) {
+            return;
+        }
+        capture_busy_boo = true;
+        capture_aborted_boo = false;
+
+        var mode_txt = (options_obj && options_obj.mode_txt) ? options_obj.mode_txt : 'viewport';
+        var skip_open_annotation_boo = !!(options_obj && options_obj.skip_open_annotation_boo);
+        var file_name_txt = (options_obj && options_obj.file_name_txt)
+            ? options_obj.file_name_txt
+            : ('screenshot-' + Date.now() + '.png');
+        var use_pending_modal_boo = skip_open_annotation_boo
+            && window.AppBuilderAnnotation
+            && typeof window.AppBuilderAnnotation.completePendingCapture === 'function';
+        var $btn = $('#btn-screenshot');
+
+        $btn.addClass('loading').prop('disabled', true);
+
+        captureIframeCanvas(mode_txt).then(function(capture_result_obj) {
+            $btn.removeClass('loading').prop('disabled', false);
+            capture_busy_boo = false;
+
+            if (capture_aborted_boo) {
+                return;
+            }
+
+            if (!capture_result_obj) {
+                if (use_pending_modal_boo) {
+                    window.AppBuilderAnnotation.failPendingCapture();
+                }
+                Swal.fire({ title: translations.aiAppBuilder.noPreviewToCapture, icon: 'warning' });
+                return;
+            }
+
+            if (capture_result_obj instanceof Blob) {
+                deliverScreenshotBlob(editor, capture_result_obj, file_name_txt, use_pending_modal_boo);
+                return;
+            }
+
+            capture_result_obj.toBlob(function(blob_obj) {
+                deliverScreenshotBlob(editor, blob_obj, file_name_txt, use_pending_modal_boo);
+            }, 'image/png');
+        }).catch(function(err_obj) {
+            $btn.removeClass('loading').prop('disabled', false);
+            capture_busy_boo = false;
+            if (capture_aborted_boo) {
+                return;
+            }
+            if (use_pending_modal_boo) {
+                window.AppBuilderAnnotation.failPendingCapture();
+            }
+            Swal.fire({ title: translations.aiAppBuilder.screenshotCaptureFailed, icon: 'error' });
+        });
+    }
+
+    /**
+     * Push a screenshot Blob into the chat attachment tray and start S3 upload.
+     * When add_to_chat_after_upload_boo is true, the upload completion handler
+     * also appends the resulting URL into #chat-input as a link chip.
+     */
+    function attachScreenshotBlob(editor, blob_obj, file_name_txt, add_to_chat_after_upload_boo) {
+        if (!blob_obj || !editor) {
+            return;
+        }
+        var timestamp_num = Date.now();
+        var file_obj = new File([blob_obj], file_name_txt, { type: 'image/png' });
+
+        var fileObj = {
+            id: timestamp_num + '_screenshot',
+            file: file_obj,
+            name: file_name_txt,
+            size: file_obj.size,
+            type: 'image',
+            preview: URL.createObjectURL(blob_obj),
+            previewIsObjectUrl: true,
+            secure_url: '',
+            uploading: true,
+            screenshot_kind_txt: 'preview_screenshot',
+            _add_to_chat_after_upload_boo: !!add_to_chat_after_upload_boo
+        };
+
+        editor.attachedFiles.push(fileObj);
+        editor.renderAttachmentPreview();
+        editor.uploadAttachmentToS3(fileObj);
+    }
+
+    /**
+     * Capture a screenshot of a specific element inside the preview iframe.
+     * Returns a Promise that resolves once the blob is created and queued
+     * for upload (the S3 upload itself continues in the background).
+     *
+     * @param {object} editor  - AIAppBuilder instance
+     * @param {Element} target_el - DOM element inside the iframe to capture
+     * @returns {Promise<object|null>} resolves with the fileObj or null on failure
+     */
+    function captureElementScreenshot(editor, target_el) {
+        var $iframe = $('.preview-frame');
+
+        var iframe_accessible_boo = false;
+        try {
+            iframe_accessible_boo = !!($iframe[0] && $iframe[0].contentDocument && $iframe[0].contentDocument.body);
+        } catch(e) {}
+
+        if (!iframe_accessible_boo || !target_el) {
+            return Promise.resolve(null);
+        }
+
+        var iframe_el = $iframe[0];
+        var iframe_win = iframe_el.contentWindow;
+        var iframe_doc = iframe_el.contentDocument;
+
+        target_el.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+
+        // Push an uploading placeholder into the tray IMMEDIATELY (before the multi-second
+        // dom-to-image capture). This makes the loading thumbnail appear right away and, more
+        // importantly, keeps `uploading: true` in attachedFiles so sendMessage's upload guard
+        // blocks the user from sending before the screenshot is ready.
+        var placeholder_timestamp_num = Date.now();
+        var placeholder_name_txt = 'element-screenshot-' + placeholder_timestamp_num + '.png';
+        var fileObj = {
+            id: placeholder_timestamp_num + '_el_screenshot',
+            file: null,
+            name: placeholder_name_txt,
+            size: 0,
+            type: 'image',
+            // Marks this image as a reference-only visual context for the AI (a screenshot of the element the user selected), not an asset to insert or use as a replacement image inside the app.
+            screenshot_kind_txt: 'element_reference',
+            preview: '',
+            previewIsObjectUrl: false,
+            secure_url: '',
+            uploading: true
+        };
+        editor.attachedFiles.push(fileObj);
+        editor.renderAttachmentPreview();
+
+        return prepareIframeForCapture(iframe_doc, iframe_win).then(function(prep_cache_obj) {
+            var metrics_obj = getPreviewCaptureMetricsFun(iframe_el, iframe_doc, iframe_win);
+            var matte_color_txt = pick_solid_matte_color_for_element(iframe_win, target_el);
+
+            var rect_now = target_el.getBoundingClientRect();
+            var crop_ref = {
+                abs_x_num: rect_now.left + metrics_obj.scroll_x_num,
+                abs_y_num: rect_now.top + metrics_obj.scroll_y_num,
+                w_num: Math.ceil(rect_now.width),
+                h_num: Math.ceil(rect_now.height)
+            };
+            var options_obj = buildDomToImageCaptureOptionsFun(
+                iframe_doc,
+                iframe_win,
+                metrics_obj,
+                prep_cache_obj,
+                true,
+                false
+            );
+
+            return captureDocumentElementToCanvasFun(iframe_doc, iframe_win, options_obj).then(function(full_canvas) {
+                if (!full_canvas) {
+                    return null;
+                }
+
+                var out_canvas = crop_canvas_from_document_rect_fun(
+                    full_canvas,
+                    metrics_obj,
+                    crop_ref.abs_x_num,
+                    crop_ref.abs_y_num,
+                    crop_ref.w_num,
+                    crop_ref.h_num,
+                    crop_ref.w_num,
+                    crop_ref.h_num,
+                    iframe_doc
+                );
+                if (!out_canvas) {
+                    return null;
+                }
+                var octx = out_canvas.getContext('2d');
+                octx.globalCompositeOperation = 'destination-over';
+                octx.fillStyle = matte_color_txt;
+                octx.fillRect(0, 0, out_canvas.width, out_canvas.height);
+                octx.globalCompositeOperation = 'source-over';
+                return out_canvas;
+            });
+        }).then(function(canvas) {
+            if (!canvas) {
+                // Capture failed — drop the placeholder so the tray/send guard clears.
+                editor.removeAttachment(fileObj.id);
+                return Promise.resolve(null);
+            }
+            return new Promise(function(resolve) {
+                canvas.toBlob(function(blob) {
+                    if (!blob) {
+                        editor.removeAttachment(fileObj.id);
+                        resolve(null);
+                        return;
+                    }
+                    // Fill the existing placeholder in place (same id) so it turns from a
+                    // loading item into the real screenshot without a flicker/duplicate.
+                    var file_obj = new File([blob], fileObj.name, { type: 'image/png' });
+                    if (fileObj.previewIsObjectUrl && fileObj.preview) {
+                        URL.revokeObjectURL(fileObj.preview);
+                    }
+                    fileObj.file = file_obj;
+                    fileObj.size = file_obj.size;
+                    fileObj.preview = URL.createObjectURL(blob);
+                    fileObj.previewIsObjectUrl = true;
+
+                    editor.renderAttachmentPreview();
+                    editor.uploadAttachmentToS3(fileObj);
+                    resolve(fileObj);
+                }, 'image/png');
+            });
+        }).catch(function() {
+            // Same safety net as captureIframeElementCanvas: never leave stand-ins behind.
+            restoreCapturedVideosFun(iframe_doc);
+            restoreInlinedImagesFun(iframe_doc);
+            editor.removeAttachment(fileObj.id);
+            return null;
+        });
+    }
+
+    /**
+     * Full scrollable document capture for background jobs (no tray / annotation UI).
+     * Used as the advisor design reference: rendered at 2x so the image model can read small
+     * text, kept under the design upload cap (full-size JPEG before any shrink).
+     *
+     * @return {Promise<Blob|null>}
+     */
+    function capturePreviewFullPageBlob() {
+        // The capture mutates the live preview iframe, so callers arriving mid-capture (Design and Structures) share it
+        if (full_page_blob_promise_obj) {
+            return full_page_blob_promise_obj;
+        }
+        var clear_promise_fun = function() {
+            full_page_blob_promise_obj = null;
+        };
+        full_page_blob_promise_obj = captureIframeCanvas('full', SCREENSHOT_DESIGN_REFERENCE_SCALE_NUM).then(function(capture_result_obj) {
+            if (!capture_result_obj) {
+                return null;
+            }
+            if (capture_result_obj instanceof Blob) {
+                return capture_result_obj;
+            }
+            return canvasToBlobWithinUploadCapFun(capture_result_obj, SCREENSHOT_DESIGN_REFERENCE_MAX_BYTES_NUM, true);
+        }).catch(function() {
+            return null;
+        });
+        full_page_blob_promise_obj.then(clear_promise_fun, clear_promise_fun);
+        return full_page_blob_promise_obj;
+    }
+
+    window.AppBuilderScreenshot = {
+        captureIframeScreenshot: captureIframeScreenshot,
+        capturePreviewFullPageBlob: capturePreviewFullPageBlob,
+        captureElementScreenshot: captureElementScreenshot,
+        attachScreenshotBlob: attachScreenshotBlob,
+        abortCapture: abortCapture,
+        prepareIframeForCapture: prepareIframeForCapture,
+        releaseIframeCapturePrep: releaseIframeCapturePrepFun,
+        captureIframeElementCanvas: captureIframeElementCanvas,
+        restoreCapturedVideos: restoreCapturedVideosFun
+    };
+
+})();
